@@ -58,7 +58,7 @@
       : fallback;
   }
 
-  var DEFAULT_SERVER = "http://localhost:8080";
+  var DEFAULT_SERVER = "";   // "" = same origin (works on any deployed domain)
   var LS_KEY         = "ntrx_id";
   var IDB_NAME       = "NtrxStore";
   var IDB_STORE      = "ids";
