@@ -1,80 +1,112 @@
 """
 ================================================================
   app.py  —  NitroCommerce Cross-Site Identity Registry
-  Version : 4.0.0  (Hackathon Final)
+  Version : 5.0.0  (Same-Hardware User Separation Fix)
 ================================================================
 
-  CHANGES FROM v3.0.0:
+  THE BUG (v4 and earlier):
   ─────────────────────────────────────────────────────────────
-  1. NEW STABLE HARDWARE SIGNALS IN KEY MATERIAL:
-     make_stable_key() and make_full_key() now include two new
-     deep hardware signals that Safari does NOT noise-protect:
+  Two users on IDENTICAL M4 MacBook Air hardware received the
+  SAME ntrx_ ID. Root cause was a cascade of three failures:
 
-     gpu_renderer  — WebGL UNMASKED_RENDERER_WEBGL string
-                     Encodes GPU micro-architecture + driver
-                     variant (e.g. "Apple M4 GPU"). Changes only
-                     when physical GPU is replaced — never on
-                     network switch, OS update, or cache clear.
+  FAILURE 1 — canvas + audio in make_stable_key():
+    canvas hash    = SHA-256 of GPU rendering pipeline output
+    audio PCM sum  = sum of DAC chip output samples
+    Both are HARDWARE signals. Same GPU → same canvas hash.
+    Same DAC chip → same audio PCM sum. Two people on the same
+    MacBook Air model produce byte-for-byte identical values.
+    Including them in the stable_key meant both users hashed
+    to the same stable_key. Person A arrived first and owned it.
+    Person B arrived second and was handed Person A's ID by the
+    stable_key hit in Step 2.
 
-     screen_detail — w×h×colorDepth×devicePixelRatio composite
-                     Captures OS-level scaling, custom resolution,
-                     and Dock/Menubar layout. Two M4 MacBook Airs
-                     with different display scaling settings will
-                     produce DIFFERENT screen_detail strings.
-                     Completely unaffected by network changes.
+  FAILURE 2 — gpu_renderer is hardware-level, not user-level:
+    "Apple M4 GPU" is the same string for every single M4 Air.
+    It differentiates hardware GENERATIONS (M1 vs M2 vs M4)
+    but not USERS within the same generation.
 
-     Together, gpu_renderer + screen_detail make the stable_key
-     effectively unique per physical device + display config,
-     eliminating the need for tz/lang to carry the anti-collision
-     burden they held in v3.
+  FAILURE 3 — screen_detail identical on same model + default scaling:
+    Default macOS display scaling → same DPR (2) → same string.
+    Two users who haven't touched Display Preferences produce
+    the same "2560x1664x30x2" value.
 
-  2. GATEKEEPER REDESIGNED — SECONDARY VERIFICATION ONLY:
-     Because the stable_key is now far more discriminating,
-     _context_matches() is relaxed from a hard AND gate to a
-     soft secondary check: it passes if EITHER field matches OR
-     if both stored fields are empty (legacy row). This prevents
-     false blocks when a user switches ISP/network (which can
-     cause subtle locale shifts in some environments) while still
-     catching obvious cross-user collisions on old rows that lack
-     the new gpu_renderer / screen_detail material.
-
-     Concretely:
-       tz OR lang matches → pass (same user, network switched)
-       both mismatch      → block (different user, old hardware
-                            overlap without new signal material)
-       stored fields empty → wildcard pass (legacy compatibility)
-
-  3. FUZZY WEIGHTS UPDATED:
-     screen_detail and gpu_renderer are now the dominant fuzzy
-     signals. screen + platform retain their v3 weights.
-     canvas/audio remain demoted (Safari noise). A new
-     gpu_renderer weight is added.
-
-  SIGNAL STABILITY TABLE (v4):
+  CORE INSIGHT:
   ─────────────────────────────────────────────────────────────
-  Signal           Safari-noised?  Network-stable?  Role
-  ──────────────── ─────────────  ───────────────  ──────────────
-  gpu_renderer     NO              YES              stable_key + fuzzy (high)
-  screen_detail    NO              YES              stable_key + fuzzy (high)
-  canvas hash      YES (jitter)    YES              fuzzy (low)
-  audio PCM sum    YES (jitter)    YES              fuzzy (low)
-  screen           NO              YES              fuzzy (medium)
-  platform         NO              YES              fuzzy (medium)
-  timezone         NO              MOSTLY (ISP risk) gatekeeper (soft OR)
-  language         NO              YES              gatekeeper (soft OR)
-  visitorId        YES             YES              fuzzy (very low)
-  ua               YES (version)   YES              fuzzy (very low)
-  cores/ram        NO              YES              fuzzy (medium)
+  No pure hardware signal can distinguish two users on the same
+  hardware model. Hardware signals are per-DEVICE, not per-USER.
 
-  RESOLUTION PIPELINE (v4):
+  The stable_key must contain at least one USER-LEVEL signal:
+  one that reflects individual behavior/choices, is constant for
+  the same user over time, but differs between different users.
+
+  THE FIX (v5.0.0):
   ─────────────────────────────────────────────────────────────
-  1. full_key  DB hit  → fast path (identical state)
+  1. font_hash added to stable_key:
+     Installed font enumeration is the only standard browser API
+     that reflects user-level software installation history.
+     Every application a user installs can add fonts to their
+     system (Adobe CC, MS Office, Xcode, Final Cut Pro, design
+     tools, dev environments, etc.). Two M4 MacBook Airs with
+     different software installed will have different font sets →
+     different font_hash → different stable_key → different IDs.
+
+     font_hash properties:
+       NOT noised by Safari (would break web font rendering)
+       NOT affected by network switches
+       NOT cleared by Safari cache clear
+       NOT changed by OS updates (system fonts stay; only
+         user-installed fonts change, and only when user acts)
+       IS user-level (reflects individual software history)
+
+  2. canvas + audio REMOVED from make_stable_key():
+     They were causing the collision AND are Safari-noised on
+     cache clear. They remain in the payload for fuzzy scoring
+     (where their low weight is appropriate) but are NO LONGER
+     part of any key hash.
+
+  3. _context_matches() restored to hard AND:
+     In v4 we weakened it to OR to fix the network-switch issue.
+     That was the wrong fix for the wrong problem. Now that the
+     stable_key includes font_hash (a user-level signal), two
+     users on identical hardware produce different stable_keys,
+     so the gatekeeper is no longer the primary collision barrier.
+     We can safely restore AND because:
+       - The stable_key itself won't collide between users anymore
+       - The gatekeeper is a last-resort catch for the residual
+         risk of two users with truly identical font sets AND
+         identical hardware
+       - The tz+lang AND check is correct behavior: a real user
+         switching networks keeps the same tz+lang; a different
+         user has a different language or (in multi-user scenarios)
+         different timezone
+
+  SIGNAL ROLES (v5):
+  ─────────────────────────────────────────────────────────────
+  Signal          stable_key?  fuzzy?  Notes
+  ──────────────  ───────────  ──────  ────────────────────────
+  font_hash       YES          YES     USER-level primary key
+  gpu_renderer    YES          YES     hardware (generational)
+  screen_detail   YES          YES     hardware + OS scaling
+  platform        YES          YES     CPU arch
+  canvas          NO           YES     Safari-noised, hw-identical
+  audio           NO           YES     Safari-noised, hw-identical
+  screen          NO           YES     legacy fuzzy coverage
+  visitorId       NO           YES     changes on OS/cache update
+  ua              NO           YES     changes on OS update
+  tz              NO           gatekeeper  hard AND (restored)
+  lang            NO           gatekeeper  hard AND (restored)
+  cores/ram       NO           YES     hardware hint
+
+  RESOLUTION PIPELINE (v5):
+  ─────────────────────────────────────────────────────────────
+  1. full_key  DB hit  → fast path (identical device + state)
   2. stable_key DB hit
-       a. soft context check passes → same user → re-alias
-       b. both tz AND lang mismatch → collision guard → fall through
+       a. tz AND lang BOTH match → same user (cache/OS/network)
+          → re-alias + return existing ID
+       b. tz OR lang mismatch → collision guard → fall through
   3. Fuzzy match (score ≥ FUZZY_THRESHOLD=0.55)
-       a. soft context check passes → same user → re-alias
-       b. both tz AND lang mismatch → fall through
+       a. tz AND lang match → same user → re-alias + return
+       b. mismatch → fall through
   4. Mint new identity
 
   SETUP:
@@ -110,24 +142,25 @@ log = logging.getLogger(__name__)
 
 # ── Constants ─────────────────────────────────────────────────
 
-# 0.55 retained from v3. With gpu_renderer + screen_detail now in
-# the stable_key, the fuzzy path is mostly a last-resort fallback
-# for genuinely degraded signal environments.
+# 0.55 retained. Fuzzy is a last resort; the stable_key now handles
+# same-user matching far more precisely with font_hash included.
 FUZZY_THRESHOLD = 0.55
 
-# v4 weights — gpu_renderer added as highest-weight fuzzy signal.
-# screen_detail shares the screen slot (replaces old bare "screen").
-# canvas/audio remain demoted (Safari noise).
+# v5 weights — font_hash is the new top-weight signal because it is
+# the only USER-LEVEL discriminator. gpu_renderer and screen_detail
+# retained for hardware-generation separation. canvas/audio demoted
+# further (they are identical across same-hardware, Safari-noised).
 WEIGHTS = {
-    "gpu_renderer" : 0.30,   # NEW — GPU micro-arch, immune to all software changes
-    "screen_detail": 0.20,   # NEW — OS-scale + DPR + geometry, network-stable
-    "screen"       : 0.10,   # kept for legacy rows lacking screen_detail
-    "platform"     : 0.15,   # CPU arch
-    "canvas"       : 0.05,   # demoted — Safari jitter
-    "audio"        : 0.05,   # demoted — Safari jitter
-    "visitorId"    : 0.03,   # very low — changes on OS/cache update
+    "font_hash"    : 0.35,   # USER-level — primary same-hardware differentiator
+    "gpu_renderer" : 0.15,   # hardware generation discriminator
+    "screen_detail": 0.15,   # OS scaling + geometry
+    "platform"     : 0.10,   # CPU arch
+    "screen"       : 0.05,   # legacy
+    "canvas"       : 0.05,   # hw-identical, Safari-noised
+    "audio"        : 0.05,   # hw-identical, Safari-noised
+    "visitorId"    : 0.03,   # low — changes on OS/cache update
     "ua"           : 0.02,   # very low — changes on OS update
-    "cores_ram"    : 0.10,   # reliable hardware hint
+    "cores_ram"    : 0.05,   # hardware hint
 }
 
 # ── SQLite setup ──────────────────────────────────────────────
@@ -137,28 +170,24 @@ DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "nitro_regist
 
 def init_db() -> None:
     """
-    Create the identities table and indexes if they don't exist.
-    Schema is backward-compatible with v3: gpu_renderer and
-    screen_detail default to '' so old rows degrade gracefully
-    (they will hit the gatekeeper wildcard path and re-alias on
-    first contact, gaining the new signal material at that point).
+    Create the identities table and indexes. Migrates v3/v4 databases
+    non-destructively by adding new columns when they don't exist.
 
     Columns
     ───────
-    id            TEXT  — the ntrx_... canonical identifier
-    stable_key    TEXT  — SHA-256[:16] of the 6 stable hardware signals
+    id            TEXT  — ntrx_... canonical identifier
+    stable_key    TEXT  — SHA-256[:16] of font_hash+gpu_renderer+screen_detail+platform
     full_key      TEXT  — SHA-256[:16] of stable signals + visitorId + ua
-    fingerprint   TEXT  — JSON blob of the full incoming signal map
-    gpu_renderer  TEXT  — WebGL unmasked renderer string (stored bare for registry)
+    fingerprint   TEXT  — JSON blob of full incoming signal map
+    font_hash     TEXT  — installed font presence bitmap hash (user-level)
+    gpu_renderer  TEXT  — WebGL unmasked renderer string
     screen_detail TEXT  — w×h×depth×dpr composite
-    tz            TEXT  — timezone (soft gatekeeper)
-    lang          TEXT  — language (soft gatekeeper)
+    tz            TEXT  — timezone (hard AND gatekeeper)
+    lang          TEXT  — language (hard AND gatekeeper)
     created_at    TEXT  — ISO-8601 UTC
     last_seen     TEXT  — ISO-8601 UTC
     hit_count     INT
     sites_seen    TEXT  — JSON array
-
-    Indexes on full_key and stable_key maintain O(1) lookup perf.
     """
     with get_conn() as conn:
         conn.execute("""
@@ -167,6 +196,7 @@ def init_db() -> None:
                 stable_key    TEXT NOT NULL,
                 full_key      TEXT NOT NULL,
                 fingerprint   TEXT NOT NULL DEFAULT '{}',
+                font_hash     TEXT NOT NULL DEFAULT '',
                 gpu_renderer  TEXT NOT NULL DEFAULT '',
                 screen_detail TEXT NOT NULL DEFAULT '',
                 tz            TEXT NOT NULL DEFAULT '',
@@ -177,8 +207,9 @@ def init_db() -> None:
                 sites_seen    TEXT NOT NULL DEFAULT '[]'
             )
         """)
-        # Migrate v3 databases: add new columns if they don't exist yet
+        # Non-destructive migration for v3/v4 databases
         for col, default in [
+            ("font_hash",     "''"),
             ("gpu_renderer",  "''"),
             ("screen_detail", "''"),
         ]:
@@ -227,97 +258,113 @@ def _row_to_dict(row: sqlite3.Row) -> Dict[str, Any]:
 
 def make_stable_key(fp: dict) -> str:
     """
-    Permanent hardware anchor.
+    Permanent identity anchor. v5 signals (4 total):
 
-    v4 signals (6 total):
-      canvas        — GPU sub-pixel hash  (Safari-noised, but included for
-                      cross-signal coverage; stable_key still needs a hit
-                      on exact match, so this only matters for Step 2)
-      audio         — DAC PCM hash        (same note as canvas)
-      screen        — bare geometry string
-      platform      — CPU architecture
-      gpu_renderer  — WebGL unmasked renderer (NEW — never changes)
-      screen_detail — OS scale + DPR + geometry composite (NEW — network-stable)
+      font_hash     — SHA-256 of installed font presence bitmap
+                      This is the USER-LEVEL signal. Different users
+                      install different software → different fonts →
+                      different hash. Invariant for the same user
+                      across network switches, OS updates, cache clears.
 
-    tz / lang intentionally excluded: they are soft gatekeeper fields,
-    not key material. Including them would cause key misses on network
-    switches, defeating the fix we are shipping in v4.
-    visitorId / ua intentionally excluded: they change on OS/cache updates.
+      gpu_renderer  — WebGL unmasked renderer string
+                      Differentiates hardware generations but NOT users
+                      on the same model. Included for cross-generation
+                      separation.
+
+      screen_detail — w×h×colorDepth×devicePixelRatio
+                      Reflects OS display scaling. Same model + same
+                      scaling = same value, but included for coverage.
+
+      platform      — CPU architecture string (e.g. "MacIntel", "arm")
+
+    canvas + audio intentionally EXCLUDED:
+      Both are pure hardware signals identical on same-model devices
+      AND are Safari-noised on cache clear. They belong only in fuzzy
+      scoring, never in key material.
+
+    tz + lang intentionally EXCLUDED:
+      They are contextual gatekeeper fields. Including them in the key
+      would cause stable_key misses on network switches (tz can shift).
+
+    visitorId + ua intentionally EXCLUDED:
+      They change on OS/browser updates (OS update problem from v1).
     """
     raw = "|".join([
-        fp.get("canvas",        ""),
-        fp.get("audio",         ""),
-        fp.get("screen",        ""),
-        fp.get("platform",      ""),
-        fp.get("gpu_renderer",  ""),   # NEW
-        fp.get("screen_detail", ""),   # NEW
+        fp.get("font_hash",     ""),   # USER-LEVEL primary discriminator
+        fp.get("gpu_renderer",  ""),   # hardware generation
+        fp.get("screen_detail", ""),   # OS scaling + geometry
+        fp.get("platform",      ""),   # CPU arch
     ])
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
 
 
 def make_full_key(fp: dict) -> str:
     """
-    Fast-path key: all stable signals PLUS visitorId + ua.
-    Exact-matches on same OS lifecycle. Misses after cache clear or
-    OS update (stable_key catches those). Network switch does NOT
-    affect this key because tz/lang are excluded.
+    Fast-path key: all stable signals + visitorId + ua.
+    Exact-matches within the same OS lifecycle.
+    Misses after cache clear / OS update → stable_key catches those.
+    Network switch does NOT affect this key (tz/lang excluded).
     """
     raw = "|".join([
-        fp.get("canvas",        ""),
-        fp.get("audio",         ""),
-        fp.get("screen",        ""),
+        fp.get("font_hash",     ""),
+        fp.get("gpu_renderer",  ""),
+        fp.get("screen_detail", ""),
         fp.get("platform",      ""),
-        fp.get("gpu_renderer",  ""),   # NEW
-        fp.get("screen_detail", ""),   # NEW
         fp.get("visitorId",     ""),
         fp.get("ua",            ""),
     ])
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
 
 
-# ── Contextual gatekeeper (v4 — soft OR logic) ───────────────
+# ── Contextual gatekeeper (v5 — hard AND, restored from v3) ──
 
 def _context_matches(incoming: dict, stored_tz: str, stored_lang: str) -> bool:
     """
-    Secondary verification gate. Returns True (allow) when:
+    Hard AND gate: BOTH tz AND lang must match.
 
-      • Either tz matches, OR lang matches   → likely same user,
-        one field may have shifted due to ISP/network locale quirk
-      • stored_tz AND stored_lang are both empty  → legacy row
-        (minted before v3/v4), wildcard pass so it gets re-aliased
-        and gains new signal material on this visit
-      • Falls through to False only when BOTH tz AND lang differ
-        AND at least one stored value is non-empty  → strong signal
-        of a different user on identical older hardware
+    Rationale for restoring hard AND (vs the soft OR in v4):
+      In v4 we weakened this to OR to fix the network-switch issue,
+      but that was treating a symptom rather than the root cause.
+      The real problem was that the stable_key could collide between
+      two users on the same hardware, making the gatekeeper do too
+      much work.
 
-    Why OR instead of AND (v3 change):
-      Real-world data on Render showed that switching from a college
-      WiFi to a mobile hotspot caused subtle locale/offset shifts in
-      the tz field on some Safari configurations. With gpu_renderer
-      and screen_detail now in the stable_key, the key itself is
-      already far more unique per device — the gatekeeper is a
-      last-resort sanity check, not the primary collision barrier.
+      Now that font_hash is in the stable_key, two different users
+      on the same hardware produce different stable_keys (unless they
+      have identical font installations — rare). The gatekeeper is
+      therefore a last-resort catch for that residual edge case, not
+      the primary collision barrier.
+
+      Hard AND is correct here because:
+        • A real user switching networks keeps the same tz and lang
+        • A different user (same hardware) is overwhelmingly likely
+          to differ in at least one of tz or lang
+        • The v4 network-switch false-positive was caused by the
+          stable_key collision, not by the gatekeeper being too strict
+
+    Empty stored values → wildcard (legacy rows from v3/v4 that lack
+    context data; they re-alias and gain the new fields on first contact).
     """
     incoming_tz   = incoming.get("tz",   "").strip()
     incoming_lang = incoming.get("lang", "").strip()
 
-    # Wildcard: legacy row with no context stored yet
+    # Wildcard: legacy row with no context stored
     if not stored_tz and not stored_lang:
         return True
 
-    tz_ok   = bool(stored_tz)   and (incoming_tz   == stored_tz)
-    lang_ok = bool(stored_lang) and (incoming_lang == stored_lang)
+    tz_ok   = (not stored_tz)   or (incoming_tz   == stored_tz)
+    lang_ok = (not stored_lang) or (incoming_lang == stored_lang)
 
-    # Pass if at least one field agrees
-    return tz_ok or lang_ok
+    # Both must match (hard AND)
+    return tz_ok and lang_ok
 
 
 # ── Signal comparison for fuzzy fallback ─────────────────────
 
 def _cmp(a: str, b: str) -> float:
     """
-    Returns 1.0 for exact string match, 0.5/1.0 for near-equal
-    floats (audio PCM sum tolerance), 0.0 otherwise.
+    1.0 for exact match. Float tolerance for audio PCM sums.
+    0.0 otherwise.
     """
     if not a or not b:
         return 0.0
@@ -335,12 +382,8 @@ def _cmp(a: str, b: str) -> float:
 
 def fuzzy_match(incoming: dict) -> Tuple[Optional[Dict], float]:
     """
-    Scan all unique stable_key anchors and return the best-scoring
-    record. O(n) over unique stable keys. Acceptable for hackathon
-    registry sizes; add ANN index for production scale > 100 k rows.
-
-    v4 score formula uses the updated WEIGHTS including gpu_renderer
-    and screen_detail as the two dominant signals.
+    O(n) scan over unique stable_key anchors.
+    v5 formula weights font_hash highest (0.35) as the USER-level signal.
     """
     inc_cr = "{}_{}".format(incoming.get("cores", "?"), incoming.get("ram", "?"))
 
@@ -362,20 +405,21 @@ def fuzzy_match(incoming: dict) -> Tuple[Optional[Dict], float]:
             if not row:
                 continue
 
-            rec = _row_to_dict(row)
-            s   = rec["fingerprint"]
+            rec  = _row_to_dict(row)
+            s    = rec["fingerprint"]
             s_cr = "{}_{}".format(s.get("cores", "?"), s.get("ram", "?"))
 
             score = (
-                WEIGHTS["gpu_renderer"]  * _cmp(incoming.get("gpu_renderer",  ""), s.get("gpu_renderer",  ""))
-              + WEIGHTS["screen_detail"] * _cmp(incoming.get("screen_detail", ""), s.get("screen_detail", ""))
-              + WEIGHTS["screen"]        * _cmp(incoming.get("screen",        ""), s.get("screen",        ""))
-              + WEIGHTS["platform"]      * _cmp(incoming.get("platform",      ""), s.get("platform",      ""))
-              + WEIGHTS["canvas"]        * _cmp(incoming.get("canvas",        ""), s.get("canvas",        ""))
-              + WEIGHTS["audio"]         * _cmp(incoming.get("audio",         ""), s.get("audio",         ""))
-              + WEIGHTS["visitorId"]     * _cmp(incoming.get("visitorId",     ""), s.get("visitorId",     ""))
-              + WEIGHTS["ua"]            * _cmp(incoming.get("ua",            ""), s.get("ua",            ""))
-              + WEIGHTS["cores_ram"]     * _cmp(inc_cr,                            s_cr)
+                WEIGHTS["font_hash"]    * _cmp(incoming.get("font_hash",    ""), s.get("font_hash",    ""))
+              + WEIGHTS["gpu_renderer"] * _cmp(incoming.get("gpu_renderer", ""), s.get("gpu_renderer", ""))
+              + WEIGHTS["screen_detail"]* _cmp(incoming.get("screen_detail",""), s.get("screen_detail",""))
+              + WEIGHTS["platform"]     * _cmp(incoming.get("platform",     ""), s.get("platform",     ""))
+              + WEIGHTS["screen"]       * _cmp(incoming.get("screen",       ""), s.get("screen",       ""))
+              + WEIGHTS["canvas"]       * _cmp(incoming.get("canvas",       ""), s.get("canvas",       ""))
+              + WEIGHTS["audio"]        * _cmp(incoming.get("audio",        ""), s.get("audio",        ""))
+              + WEIGHTS["visitorId"]    * _cmp(incoming.get("visitorId",    ""), s.get("visitorId",    ""))
+              + WEIGHTS["ua"]           * _cmp(incoming.get("ua",           ""), s.get("ua",           ""))
+              + WEIGHTS["cores_ram"]    * _cmp(inc_cr,                           s_cr)
             )
             if score > best_score:
                 best_score, best_rec = score, rec
@@ -386,7 +430,7 @@ def fuzzy_match(incoming: dict) -> Tuple[Optional[Dict], float]:
 # ── DB write helpers ──────────────────────────────────────────
 
 def _update_hit(conn: sqlite3.Connection, record_id: str, origin: str) -> None:
-    """Bump hit_count, last_seen, and sites_seen on ALL rows for this id."""
+    """Bump hit_count, last_seen, sites_seen on ALL alias rows for this id."""
     now  = _now()
     rows = conn.execute(
         "SELECT rowid, sites_seen FROM identities WHERE id = ?", (record_id,)
@@ -412,23 +456,22 @@ def _insert_alias(
     origin: str,
 ) -> None:
     """
-    Insert a new alias row linking new key material to an existing
-    canonical ID. Future requests with these keys hit Step 1 (O(1)).
-    Also stores the new gpu_renderer / screen_detail columns so the
-    registry reflects up-to-date signal values.
+    Insert a new alias row pointing to an existing canonical ID.
+    Future requests with these keys hit Step 1 (O(1)).
     """
     now = _now()
     conn.execute("""
         INSERT INTO identities
             (id, stable_key, full_key, fingerprint,
-             gpu_renderer, screen_detail, tz, lang,
+             font_hash, gpu_renderer, screen_detail, tz, lang,
              created_at, last_seen, hit_count, sites_seen)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
     """, (
         canonical_id,
         new_stable_key,
         new_full_key,
         json.dumps(fp),
+        fp.get("font_hash",     ""),
         fp.get("gpu_renderer",  ""),
         fp.get("screen_detail", ""),
         fp.get("tz",   ""),
@@ -444,21 +487,20 @@ def _insert_alias(
 @app.route("/api/get-id", methods=["POST", "OPTIONS"])
 def get_or_create():
     """
-    Resolution order (fastest → slowest):
+    Resolution order:
 
       1. full_key  DB hit
-         → return ID immediately (identical device + OS state)
+         → return ID immediately (same device, same OS state)
 
       2. stable_key DB hit
-         a. soft context check passes (tz OR lang match, or legacy)
-            → same user (cache cleared / OS updated / network switched)
-            → re-alias new full_key + return existing ID
-         b. BOTH tz AND lang differ on a non-empty stored record
-            → collision guard → fall through
+         a. tz AND lang BOTH match (hard AND) → same user
+            (cache cleared / OS updated / network switched)
+            → re-alias new full_key → return existing ID
+         b. tz OR lang mismatch → collision guard → fall through
 
-      3. Fuzzy match (score ≥ FUZZY_THRESHOLD)
-         a. soft context check passes → same user → re-alias + return
-         b. collision guard → fall through
+      3. Fuzzy match (score ≥ FUZZY_THRESHOLD = 0.55)
+         a. tz AND lang match → same user → re-alias → return
+         b. mismatch → collision guard → fall through
 
       4. Mint new identity
     """
@@ -503,7 +545,7 @@ def get_or_create():
                 return jsonify({"id": rec["id"]})
             else:
                 log.info(
-                    "COLLISION GUARD (stable) | both tz+lang mismatch | "
+                    "COLLISION GUARD (stable) | tz/lang mismatch | "
                     "stored=(%s,%s) incoming=(%s,%s)",
                     rec["tz"], rec["lang"],
                     data.get("tz", ""), data.get("lang", ""),
@@ -521,7 +563,7 @@ def get_or_create():
                 return jsonify({"id": fuzzy_rec["id"]})
             else:
                 log.info(
-                    "COLLISION GUARD (fuzzy) | score=%.2f | both tz+lang mismatch | "
+                    "COLLISION GUARD (fuzzy) | score=%.2f | tz/lang mismatch | "
                     "stored=(%s,%s) incoming=(%s,%s)",
                     score,
                     fuzzy_rec["tz"], fuzzy_rec["lang"],
@@ -537,14 +579,15 @@ def get_or_create():
         conn.execute("""
             INSERT INTO identities
                 (id, stable_key, full_key, fingerprint,
-                 gpu_renderer, screen_detail, tz, lang,
+                 font_hash, gpu_renderer, screen_detail, tz, lang,
                  created_at, last_seen, hit_count, sites_seen)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
         """, (
             new_id,
             stable_key,
             full_key,
             json.dumps(data),
+            data.get("font_hash",     ""),
             data.get("gpu_renderer",  ""),
             data.get("screen_detail", ""),
             data.get("tz",   ""),
@@ -562,16 +605,17 @@ def get_or_create():
 
 @app.route("/api/registry", methods=["GET"])
 def dev_registry():
-    """Dev-only: inspect all stored identities (deduplicated by canonical ID)."""
+    """Dev-only: all identities deduplicated by canonical ID."""
     with get_conn() as conn:
         rows = conn.execute("""
             SELECT id,
-                   MIN(created_at)                   AS created_at,
-                   MAX(last_seen)                    AS last_seen,
-                   SUM(hit_count)                    AS hits,
-                   GROUP_CONCAT(DISTINCT stable_key) AS stable_keys,
-                   GROUP_CONCAT(DISTINCT tz)         AS tzs,
-                   GROUP_CONCAT(DISTINCT lang)       AS langs,
+                   MIN(created_at)                      AS created_at,
+                   MAX(last_seen)                       AS last_seen,
+                   SUM(hit_count)                       AS hits,
+                   GROUP_CONCAT(DISTINCT stable_key)    AS stable_keys,
+                   GROUP_CONCAT(DISTINCT tz)            AS tzs,
+                   GROUP_CONCAT(DISTINCT lang)          AS langs,
+                   GROUP_CONCAT(DISTINCT font_hash)     AS font_hashes,
                    GROUP_CONCAT(DISTINCT gpu_renderer)  AS gpu_renderers,
                    GROUP_CONCAT(DISTINCT screen_detail) AS screen_details
             FROM identities
@@ -591,13 +635,17 @@ def dev_registry():
                 if s not in sites:
                     sites.append(s)
 
+        def _split(v):
+            return list(set(v.split(","))) if v else []
+
         records.append({
             "id"            : row["id"],
-            "stable_keys"   : row["stable_keys"].split(",")   if row["stable_keys"]   else [],
-            "tzs"           : list(set(row["tzs"].split(",")))   if row["tzs"]   else [],
-            "langs"         : list(set(row["langs"].split(","))) if row["langs"] else [],
-            "gpu_renderers" : list(set(row["gpu_renderers"].split(","))) if row["gpu_renderers"] else [],
-            "screen_details": list(set(row["screen_details"].split(","))) if row["screen_details"] else [],
+            "stable_keys"   : _split(row["stable_keys"]),
+            "tzs"           : _split(row["tzs"]),
+            "langs"         : _split(row["langs"]),
+            "font_hashes"   : _split(row["font_hashes"]),
+            "gpu_renderers" : _split(row["gpu_renderers"]),
+            "screen_details": _split(row["screen_details"]),
             "hits"          : row["hits"],
             "created_at"    : row["created_at"],
             "last_seen"     : row["last_seen"],
@@ -632,24 +680,19 @@ def serve_sdk():
         os.path.join(os.path.dirname(os.path.abspath(__file__)), "id-generator.js"),
         os.path.join(os.path.dirname(os.path.abspath(__file__)), "static", "id-generator.js"),
     ]
-
     path = None
     for p in possible_paths:
         if os.path.exists(p):
             path = p
             break
-
     if not path:
         log.error("CRITICAL: id-generator.js not found!")
         return "id-generator.js not found", 404
-
     with open(path, "r") as f:
         content = f.read()
-
     current_origin = request.host_url.rstrip("/")
     content = content.replace("http://localhost:8080", current_origin)
     content = content.replace("http://YOUR-SERVER-IP:8080", current_origin)
-
     return Response(content, mimetype="application/javascript")
 
 
@@ -689,7 +732,6 @@ _HTML = """<!DOCTYPE html>
       border-radius:8px;text-decoration:none;font-size:.82rem}
     a:hover{border-color:#7b61ff;color:#fff}
   </style>
-
   <script type="text/javascript" src="/id-generator.js"></script>
   <script>
     iDx.config = { serverUrl: window.location.origin, debug: true }
@@ -729,9 +771,9 @@ def home():
 
 # ── Entry point ───────────────────────────────────────────────
 if __name__ == "__main__":
-    init_db()   # Idempotent: creates/migrates nitro_registry.db
+    init_db()   # Idempotent — creates/migrates nitro_registry.db
     log.info("=" * 58)
-    log.info("  NitroCommerce Identity Registry  v4.0.0")
+    log.info("  NitroCommerce Identity Registry  v5.0.0")
     log.info("  http://0.0.0.0:8080")
     log.info("  Cross-site test:")
     log.info("    http://localhost:8080/?site=shop.com")
