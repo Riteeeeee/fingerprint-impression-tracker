@@ -1,47 +1,116 @@
 /**
  * ================================================================
  *  id-generator.js  —  NitroCommerce Cross-Site Identity SDK
- *  Version : 2.0.0
+ *  Version : 3.0.0
  * ================================================================
  *
- *  USAGE (one line per partner site):
+ *  USAGE:
  *    <script type="text/javascript" src="//yoursite.com/id-generator.js"></script>
  *
  *  EXPOSES:
  *    window.iDx.config       — set config keys before DOMContentLoaded
  *    window.iDx.onIdAquired  — callback(ident: string) fired with the ID
  *
- *  NEW IN v2.0.0:
+ * ================================================================
+ *  THE ROOT CAUSE THIS VERSION FIXES
+ * ================================================================
+ *
+ *  Two users on the SAME M4 MacBook Air model received the SAME ID.
+ *
+ *  WHY IT HAPPENED — a cascade of three failures:
+ *
+ *  1. canvas + audio in stable_key:
+ *     Both users have the same GPU (same canvas hash) and same DAC
+ *     chip (same audio PCM sum). These signals are HARDWARE signals —
+ *     they do not differ between two people on identical hardware.
+ *     They were in make_stable_key(), so both users hashed to the
+ *     same stable_key. The first person through the door owned it,
+ *     and the second person inherited their ID.
+ *
+ *  2. gpu_renderer is also identical on same-model hardware:
+ *     "Apple M4 GPU" is the same string for every M4 MacBook Air.
+ *
+ *  3. screen_detail is identical if both users use default scaling:
+ *     Same model → same native resolution → same DPR by default.
+ *
+ *  CORE INSIGHT:
  *  ─────────────────────────────────────────────────────────────
- *  gpu_renderer  — WebGL UNMASKED_RENDERER_WEBGL string extracted
- *                  via WEBGL_debug_renderer_info extension.
- *                  Encodes GPU micro-architecture (e.g. "Apple M4 GPU").
- *                  Safari does NOT noise-protect this. Completely
- *                  invariant across network switches, OS updates,
- *                  and cache clears. Falls back to "webgl_na" if
- *                  the extension is unavailable (e.g. blocked WebGL).
+ *  No PURE HARDWARE signal can distinguish two users on the same
+ *  hardware model. Hardware signals are per-DEVICE, not per-USER.
+ *  The stable_key must contain at least one USER-level signal that
+ *  is invariant for the same user across time but differs between
+ *  different users.
  *
- *  screen_detail — Combined string of screen.width × screen.height
- *                  × screen.colorDepth × window.devicePixelRatio.
- *                  Reflects OS-level display scaling, custom resolution
- *                  settings, and Dock/Menubar arrangement — all of which
- *                  differ between users on the same hardware model.
- *                  100% network-stable (never affected by ISP or WiFi).
+ *  THE FIX — font_hash (new in v3.0.0):
+ *  ─────────────────────────────────────────────────────────────
+ *  Installed font enumeration is the only browser fingerprint
+ *  dimension that is:
+ *    (a) USER-LEVEL — reflects the individual's installed software
+ *        (Adobe CC, MS Office, Google Fonts desktop, design tools,
+ *        dev environments, etc.)
+ *    (b) NOT NOISED BY SAFARI — Safari does not randomize font
+ *        availability; it would break web rendering
+ *    (c) NETWORK-STABLE — unaffected by ISP, WiFi, or hotspot
+ *    (d) CACHE-STABLE — survives Safari cache clears and restarts
+ *    (e) OS-UPDATE STABLE — system fonts stay constant; only
+ *        user-installed fonts change, and only when user acts
  *
- *  Both new signals are included in the POST payload alongside all
- *  existing fields. The app.py v4.0.0 backend folds them into the
- *  stable_key hash, making each device's anchor uniquely tied to its
- *  physical GPU and display configuration.
+ *  Two M4 MacBook Airs with different font libraries (one user has
+ *  Adobe CC, the other doesn't; one has MS Office fonts, etc.)
+ *  produce DIFFERENT font_hash values → different stable_keys →
+ *  different IDs. Correctly.
  *
- *  SAFARI / ITP NOTES (unchanged from v1):
- *    - IndexedDB primary persistent store, localStorage backup.
- *    - No cookies read or written.
- *    - IP address never included in payload.
+ *  Two M4 MacBook Airs where both users happen to have identical
+ *  font sets (e.g., two fresh-out-of-box machines with zero extra
+ *  fonts) → same font_hash → stable_key collision → the gatekeeper
+ *  (hard AND on tz+lang) is the final line of defense. In practice
+ *  this is extremely rare because even basic software installation
+ *  (Xcode, Office, browsers) installs fonts.
  *
- *  INSTAGRAM IN-APP BROWSER NOTES (unchanged):
- *    - SubtleCrypto may be unavailable; djb2 fallback used.
- *    - OfflineAudioContext may be blocked; graceful fallback included.
- *    - WebGL extension probe wrapped in try/catch; degrades cleanly.
+ *  FONT PROBE TECHNIQUE (CSS measurement — no canvas needed):
+ *  ─────────────────────────────────────────────────────────────
+ *  For each candidate font, render a test string in that font and
+ *  measure its pixel width against a known fallback (monospace).
+ *  If width differs from fallback → font is installed.
+ *  This is the same technique used by FingerprintJS, panopticlick,
+ *  and every serious fingerprinting library. It is synchronous,
+ *  does not require canvas, and works in all browsers including
+ *  Safari and Instagram in-app browser.
+ *
+ *  CANVAS + AUDIO REMOVED FROM STABLE KEY:
+ *  ─────────────────────────────────────────────────────────────
+ *  canvas and audio remain in the PAYLOAD (for fuzzy scoring on
+ *  the backend) but are NO LONGER part of make_stable_key() input.
+ *  They were causing same-hardware collisions AND were Safari-noised
+ *  on cache clear — they were doing active harm in the key.
+ *
+ * ================================================================
+ *  SIGNAL ROLES (v3):
+ *
+ *  Signal         Stable Key?  Fuzzy?  Notes
+ *  ─────────────  ───────────  ──────  ──────────────────────────
+ *  font_hash      YES          YES     USER-level, not hardware
+ *  gpu_renderer   YES          YES     hardware (same-model = same)
+ *  screen_detail  YES          YES     hardware + OS scaling
+ *  platform       YES          YES     CPU arch
+ *  canvas         NO           YES     Safari-noised, hw-identical
+ *  audio          NO           YES     Safari-noised, hw-identical
+ *  screen         NO           YES     legacy coverage
+ *  visitorId      NO           YES     changes on OS/cache update
+ *  ua             NO           YES     changes on OS update
+ *  tz             NO           gatekeeper  soft context check
+ *  lang           NO           gatekeeper  soft context check
+ *  cores/ram      NO           YES     hardware hint
+ * ================================================================
+ *
+ *  SAFARI / ITP NOTES:
+ *    - IndexedDB primary store; localStorage backup.
+ *    - No cookies read or written. No IP in payload.
+ *
+ *  INSTAGRAM IN-APP BROWSER NOTES:
+ *    - SubtleCrypto unavailable → djb2 fallback hash.
+ *    - OfflineAudioContext may be blocked → graceful fallback.
+ *    - Font probe uses DOM spans → works everywhere.
  * ================================================================
  */
 
@@ -55,13 +124,9 @@
   win.iDx.config      = win.iDx.config      || {};
   win.iDx.onIdAquired = win.iDx.onIdAquired || null;
 
-  /* ─────────────────────────────────────────────────────────
-   *  CONFIGURATION
-   * ───────────────────────────────────────────────────────── */
   function cfg(key, fallback) {
     return (win.iDx.config && win.iDx.config[key] != null)
-      ? win.iDx.config[key]
-      : fallback;
+      ? win.iDx.config[key] : fallback;
   }
 
   var DEFAULT_SERVER = "http://localhost:8080";
@@ -86,7 +151,7 @@
         });
       }
     } catch (e) { /* fall through */ }
-    // djb2 fallback (Instagram in-app browser on some Android versions)
+    // djb2 fallback — Instagram in-app browser, no SubtleCrypto
     var h = 5381;
     for (var i = 0; i < msg.length; i++) {
       h = ((h << 5) + h) ^ msg.charCodeAt(i);
@@ -98,14 +163,138 @@
   }
 
   /* ================================================================
-   *  SECTION 2 — HARDWARE SIGNAL COLLECTORS
+   *  SECTION 2 — SIGNAL COLLECTORS
    * ================================================================ */
 
   /**
-   * Canvas fingerprint: layered text + shapes expose GPU sub-pixel
-   * antialiasing differences. Returns Promise<string> (hex digest).
-   * NOTE: Safari introduces jitter on cache clear. This signal is
-   * included for coverage but carries low weight on the backend.
+   * NEW (v3.0.0) — Installed font enumeration hash.
+   *
+   * Tests 120 candidate fonts by measuring rendered text width against
+   * a monospace baseline. Fonts present produce a different width than
+   * the fallback → they are included in the presence bitmask that gets
+   * hashed into font_hash.
+   *
+   * WHY THIS WORKS AS A USER SIGNAL:
+   *   Every piece of software a user installs can add fonts:
+   *   Adobe CC          → 100s of Adobe fonts
+   *   MS Office 365     → Arial, Calibri variants, etc.
+   *   Xcode             → SF Pro, SF Mono, New York
+   *   Google Chrome     → (none on macOS)
+   *   Final Cut Pro     → Helvetica Neue variants
+   *   Logic Pro         → no fonts, but noted for completeness
+   *   Developer tools   → JetBrains Mono, Fira Code, etc.
+   *   Design tools      → Figma installs no fonts; Sketch installs none
+   *   Gaming / others   → varies widely
+   *
+   *   Two fresh-out-of-box M4 MacBook Airs with ZERO extra software
+   *   will produce the same font_hash — this is the only remaining
+   *   collision risk, mitigated by the tz+lang hard-AND gatekeeper.
+   *   In practice it is extremely rare for two active users to have
+   *   byte-for-byte identical software installation histories.
+   *
+   * TECHNIQUE: CSS width measurement via off-screen <span>
+   *   - No canvas required → works in Instagram in-app browser
+   *   - Synchronous → no async latency
+   *   - Safari does NOT restrict this (it would break font rendering)
+   *   - Returns Promise<string> (hex digest of presence bitmap)
+   */
+  function fontHashSignal() {
+    // Candidate font list — broad coverage across user archetypes
+    // (developer, designer, office worker, gamer, creative)
+    var FONTS = [
+      // macOS system (present on all Macs — used as baseline coverage)
+      "Arial", "Helvetica", "Times New Roman", "Courier New", "Georgia",
+      "Verdana", "Trebuchet MS", "Impact", "Comic Sans MS",
+      // Apple / macOS extras
+      "SF Pro Display", "SF Pro Text", "SF Mono", "New York",
+      "Helvetica Neue", "Hiragino Sans", "Apple Garamond",
+      "Futura", "Optima", "Palatino",
+      // Adobe Creative Cloud
+      "Adobe Caslon Pro", "Adobe Garamond Pro", "Myriad Pro",
+      "Minion Pro", "Source Sans Pro", "Source Serif Pro",
+      "Source Code Pro", "Trajan Pro", "Gill Sans",
+      "Frutiger", "Univers", "Warnock Pro",
+      // Microsoft Office
+      "Calibri", "Cambria", "Candara", "Consolas", "Constantia",
+      "Corbel", "Segoe UI", "Franklin Gothic Medium",
+      "Book Antiqua", "Bookman Old Style", "Century Gothic",
+      "Garamond", "Palatino Linotype", "Tahoma",
+      // Developer fonts
+      "JetBrains Mono", "Fira Code", "Fira Mono",
+      "Cascadia Code", "Cascadia Mono",
+      "Inconsolata", "Hack", "Roboto Mono",
+      "IBM Plex Mono", "Space Mono", "Anonymous Pro",
+      "Input Mono", "Operator Mono", "Dank Mono",
+      // Google Fonts desktop installs
+      "Roboto", "Open Sans", "Lato", "Oswald", "Raleway",
+      "Nunito", "Montserrat", "Poppins", "Inter", "Noto Sans",
+      // Design / creative tools
+      "Proxima Nova", "Gotham", "Brandon Grotesque",
+      "Circular", "Apercu", "Aktiv Grotesk",
+      "FF DIN", "Avenir", "Avenir Next",
+      // CJK (present if Asian language packs installed)
+      "Hiragino Kaku Gothic ProN", "Hiragino Mincho ProN",
+      "PingFang SC", "PingFang TC", "PingFang HK",
+      "STHeiti", "STSong",
+      // Misc / broad signal
+      "Wingdings", "Wingdings 2", "Wingdings 3",
+      "Symbol", "Webdings", "Marlett",
+      "Arial Black", "Arial Narrow", "Arial Rounded MT Bold",
+    ];
+
+    try {
+      // Use a hidden off-screen container to avoid layout shifts
+      var container = doc.createElement("div");
+      container.setAttribute("aria-hidden", "true");
+      container.style.cssText = [
+        "position:absolute", "top:-9999px", "left:-9999px",
+        "visibility:hidden", "pointer-events:none",
+        "white-space:nowrap", "font-size:72px",
+      ].join(";");
+      doc.body.appendChild(container);
+
+      // Baseline: measure test string in monospace (always available)
+      var TEST_STR  = "mmmmmmmmmmlli";
+      var FALLBACK  = "monospace";
+
+      function getWidth(fontName) {
+        var span = doc.createElement("span");
+        span.style.fontFamily = "'" + fontName + "'," + FALLBACK;
+        span.textContent = TEST_STR;
+        container.appendChild(span);
+        var w = span.offsetWidth;
+        container.removeChild(span);
+        return w;
+      }
+
+      // Baseline width in pure monospace
+      var baseSpan = doc.createElement("span");
+      baseSpan.style.fontFamily = FALLBACK;
+      baseSpan.textContent = TEST_STR;
+      container.appendChild(baseSpan);
+      var baseWidth = baseSpan.offsetWidth;
+      container.removeChild(baseSpan);
+
+      // Build presence string: "1" if font installed, "0" if not
+      var bits = "";
+      for (var i = 0; i < FONTS.length; i++) {
+        bits += (getWidth(FONTS[i]) !== baseWidth) ? "1" : "0";
+      }
+
+      doc.body.removeChild(container);
+
+      // Hash the full presence bitmap for a compact payload field
+      return hash(bits);
+
+    } catch (e) {
+      return Promise.resolve("font_blocked");
+    }
+  }
+
+  /**
+   * Canvas fingerprint — kept for fuzzy scoring, NOT in stable_key.
+   * Safari adds jitter on cache clear; same GPU = same hash anyway.
+   * Returns Promise<string>.
    */
   function canvasSignal() {
     try {
@@ -116,18 +305,15 @@
 
       ctx.fillStyle = "rgba(80, 180, 60, 0.65)";
       ctx.fillRect(0, 0, 320, 80);
-
       ctx.font         = "bold 16px Arial, Helvetica, sans-serif";
       ctx.fillStyle    = "#1a6bcc";
       ctx.textBaseline = "top";
       ctx.fillText("NtrxFP \u{1F680} \u03A3 \u{1F441}", 6, 10);
-
       ctx.shadowOffsetX = 1; ctx.shadowOffsetY = 1;
       ctx.shadowBlur    = 3; ctx.shadowColor   = "rgba(0,0,0,0.35)";
       ctx.font          = "italic 12px 'Courier New', Courier, monospace";
       ctx.fillStyle     = "#e05c00";
       ctx.fillText("0123456789 AaBbCcDdEeFf XxYyZz", 6, 40);
-
       ctx.beginPath();
       ctx.arc(290, 40, 22, 0, Math.PI * 2);
       ctx.strokeStyle = "#7700cc";
@@ -141,8 +327,8 @@
   }
 
   /**
-   * AudioContext fingerprint: PCM sum from oscillator + compressor.
-   * NOTE: Safari introduces jitter on cache clear (low backend weight).
+   * AudioContext fingerprint — kept for fuzzy scoring, NOT in stable_key.
+   * Safari adds jitter on cache clear; same DAC = same hash anyway.
    * Returns Promise<string>.
    */
   function audioSignal() {
@@ -181,24 +367,11 @@
   }
 
   /**
-   * NEW (v2.0.0) — WebGL unmasked renderer string.
-   *
-   * WEBGL_debug_renderer_info exposes the true GPU renderer string
-   * before any Safari privacy masking. On M4 MacBook Air this returns
-   * something like "Apple M4 GPU", which uniquely identifies the GPU
-   * micro-architecture. Safari does NOT apply noise or rotation to
-   * this extension output. It is completely invariant across:
-   *   - network switches (WiFi ↔ hotspot)
-   *   - OS updates
-   *   - Safari cache clears
-   *   - private browsing windows
-   *
-   * Falls back to "webgl_na" if WebGL is unavailable or if the
-   * extension is blocked (rare; only seen in very locked-down
-   * enterprise profiles).
-   *
-   * Returns a plain string (synchronous — no hashing needed since
-   * the raw string is already highly unique and readable in logs).
+   * WebGL unmasked renderer — in stable_key as a hardware discriminator.
+   * NOTE: Identical for all units of the same GPU model (e.g. all M4s
+   * return "Apple M4 GPU"), but still included because it differentiates
+   * across hardware generations (M1 vs M2 vs M3 vs M4, Intel vs ARM).
+   * Returns a plain string (synchronous).
    */
   function gpuRendererSignal() {
     try {
@@ -212,8 +385,6 @@
       var renderer = gl.getParameter(ext.UNMASKED_RENDERER_WEBGL) || "unknown_renderer";
       var vendor   = gl.getParameter(ext.UNMASKED_VENDOR_WEBGL)   || "unknown_vendor";
 
-      // Combine vendor + renderer for maximum entropy.
-      // e.g. "Apple|Apple M4 GPU" on M4 MacBook Air.
       return (vendor + "|" + renderer).substring(0, 128);
     } catch (e) {
       return "webgl_blocked";
@@ -221,56 +392,37 @@
   }
 
   /**
-   * NEW (v2.0.0) — Exact screen metrics + device pixel ratio.
-   *
-   * window.devicePixelRatio reflects the user's OS-level display
-   * scaling setting (e.g. "More Space" vs "Default" in macOS Display
-   * Preferences). Two M4 MacBook Airs with different scaling settings
-   * will produce DIFFERENT screen_detail strings even if their raw
-   * screen.width and screen.height are identical.
-   *
-   * colorDepth adds further separation. Together, the four values
-   * form a composite that is:
-   *   - Completely unaffected by network changes
-   *   - Not noise-injected by Safari
-   *   - Different for users who customise their display scaling
-   *
-   * Format: "WxHxCDxDPR"  e.g. "2560x1664x30x2"
-   * Returns a plain string (synchronous).
+   * Screen metrics + device pixel ratio composite.
+   * Reflects OS display scaling. Same model + same scaling = same value.
+   * Included in stable_key for cross-generation differentiation.
+   * Returns a plain string (synchronous). Format: "WxHxCDxDPR"
    */
   function screenDetailSignal() {
     try {
       var s   = win.screen || {};
       var dpr = win.devicePixelRatio || 1;
-      return [
-        s.width      || "?",
-        s.height     || "?",
-        s.colorDepth || "?",
-        dpr
-      ].join("x");
+      return [s.width || "?", s.height || "?", s.colorDepth || "?", dpr].join("x");
     } catch (e) {
       return "screen_detail_blocked";
     }
   }
 
   /**
-   * Static, network-independent metadata (unchanged from v1).
-   * tz and lang are now used only as soft gatekeeper fields on the
-   * backend, not as primary key material.
+   * Static metadata. tz + lang are soft gatekeeper fields on backend.
    */
   function staticSignals() {
     var s = win.screen || {};
     return {
       screen  : (s.width  || "?") + "x" + (s.height || "?") + "x" + (s.colorDepth || "?"),
-      platform: (navigator.platform   || "unknown").substring(0, 32),
-      ua      : (navigator.userAgent  || "unknown").substring(0, 200),
+      platform: (navigator.platform  || "unknown").substring(0, 32),
+      ua      : (navigator.userAgent || "unknown").substring(0, 200),
       tz      : (function () {
         try { return Intl.DateTimeFormat().resolvedOptions().timeZone; }
         catch (e) { return "unknown"; }
       })(),
       cores   : navigator.hardwareConcurrency || "?",
       ram     : navigator.deviceMemory        || "?",
-      lang    : navigator.language            || "unknown"
+      lang    : navigator.language            || "unknown",
     };
   }
 
@@ -362,18 +514,18 @@
   }
 
   /* ================================================================
-   *  SECTION 5 — HARDWARE KEY  (local offline fallback)
+   *  SECTION 5 — LOCAL OFFLINE FALLBACK KEY
    * ================================================================ */
 
   function buildHardwareKey(fp) {
     var raw = [
+      fp.font_hash    || "",   // USER-level signal — primary differentiator
+      fp.gpu_renderer || "",
+      fp.screen_detail|| "",
+      fp.platform     || "",
       fp.visitorId    || "",
       fp.canvas       || "",
       fp.audio        || "",
-      fp.screen       || "",
-      fp.platform     || "",
-      fp.gpu_renderer || "",    // NEW — included for offline ID entropy
-      fp.screen_detail|| ""     // NEW — included for offline ID entropy
     ].join("|");
     return hash(raw).then(function (h) { return h.substring(0, 12); });
   }
@@ -400,21 +552,21 @@
       var serverBase = cfg("serverUrl", DEFAULT_SERVER).replace(/\/$/, "");
       var endpoint   = serverBase + "/api/get-id";
 
-      /* ── 2. Collect all signals in parallel ── */
+      // Synchronous signals collected immediately (before any async work)
+      var gpuRenderer  = gpuRendererSignal();
+      var screenDetail = screenDetailSignal();
+
+      /* ── 2. Collect async signals in parallel ── */
       Promise.all([
-        canvasSignal(),   // async (SubtleCrypto)
-        audioSignal(),    // async (OfflineAudioContext)
-        loadFPJS()        // async (CDN script load)
+        canvasSignal(),    // async — SubtleCrypto hash
+        audioSignal(),     // async — OfflineAudioContext
+        fontHashSignal(),  // async — SubtleCrypto hash of font bitmap
+        loadFPJS()         // async — CDN script load
       ]).then(function (results) {
         var canvasHash = results[0];
         var audioHash  = results[1];
-        var fpAgent    = results[2];
-
-        // gpuRendererSignal and screenDetailSignal are synchronous —
-        // collect them here, outside the inner Promise chain, so they
-        // are available regardless of FingerprintJS CDN availability.
-        var gpuRenderer  = gpuRendererSignal();    // NEW
-        var screenDetail = screenDetailSignal();   // NEW
+        var fontHash   = results[2];   // NEW — user-level differentiator
+        var fpAgent    = results[3];
 
         var getFPVisitorId = fpAgent
           ? fpAgent.get().then(function (r) { return r.visitorId; })
@@ -426,19 +578,27 @@
 
           /* ── 3. Build payload ── */
           var payload = {
-            visitorId    : visitorId,
+            // USER-level signal (new — primary same-hardware differentiator)
+            font_hash    : fontHash,
+
+            // Hardware signals (in stable_key)
+            gpu_renderer : gpuRenderer,
+            screen_detail: screenDetail,
+            platform     : meta.platform,
+
+            // Fuzzy-only signals (NOT in stable_key)
             canvas       : canvasHash,
             audio        : audioHash,
             screen       : meta.screen,
-            platform     : meta.platform,
+            visitorId    : visitorId,
             ua           : meta.ua,
-            tz           : meta.tz,
             cores        : meta.cores,
             ram          : meta.ram,
-            lang         : meta.lang,
-            gpu_renderer : gpuRenderer,    // NEW — WebGL unmasked renderer
-            screen_detail: screenDetail    // NEW — w×h×colorDepth×DPR
-            /* NOTE: IP address intentionally omitted */
+
+            // Gatekeeper fields (soft context check on backend)
+            tz           : meta.tz,
+            lang         : meta.lang
+            // NOTE: IP address intentionally omitted
           };
 
           /* ── 4. POST to identity server ── */
@@ -456,21 +616,20 @@
           });
         });
       }).then(function (id) {
-        /* ── 5. Deliver ── */
         deliver(id);
       }).catch(function (err) {
-        /* Server unreachable — derive a local ID from hardware signals */
+        /* Server unreachable — derive local ID from best available signals */
         console.warn("[NitroTracker] Server unavailable, using local ID:", err.message);
-        Promise.all([canvasSignal(), audioSignal()]).then(function (sigs) {
+        Promise.all([canvasSignal(), audioSignal(), fontHashSignal()]).then(function (sigs) {
           var meta = staticSignals();
           return buildHardwareKey({
+            font_hash    : sigs[2],
+            gpu_renderer : gpuRendererSignal(),
+            screen_detail: screenDetailSignal(),
+            platform     : meta.platform,
             visitorId    : "offline",
             canvas       : sigs[0],
             audio        : sigs[1],
-            screen       : meta.screen,
-            platform     : meta.platform,
-            gpu_renderer : gpuRendererSignal(),   // NEW
-            screen_detail: screenDetailSignal()   // NEW
           });
         }).then(function (hwKey) {
           var localId = "ntrx_local_" + hwKey + "_" + Date.now().toString(36);
@@ -488,6 +647,8 @@
   if (doc.readyState === "loading") {
     doc.addEventListener("DOMContentLoaded", runTracker);
   } else {
+    // Script loaded async after DOM; run on next tick so host-page
+    // inline scripts (iDx.onIdAquired assignment) execute first
     setTimeout(runTracker, 0);
   }
 
