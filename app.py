@@ -638,9 +638,12 @@ def home():
     return render_template_string(_HTML, site=site)
 
 
+# Run on import too, so gunicorn (deploy) also creates the DB.
+init_db()   # idempotent: CREATE TABLE IF NOT EXISTS
+
+
 # ── Entry point ───────────────────────────────────────────────
 if __name__ == "__main__":
-    init_db()   # Creates nitro_registry.db + indexes on first run
     log.info("=" * 58)
     log.info("  NitroCommerce Identity Registry  v3.0.0")
     log.info("  http://0.0.0.0:8080")
@@ -651,4 +654,5 @@ if __name__ == "__main__":
     log.info("  Registry:     http://localhost:8080/api/registry")
     log.info("  Raw rows:     http://localhost:8080/api/registry/raw")
     log.info("=" * 58)
-    app.run(host="0.0.0.0", port=8080, debug=True)
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host="0.0.0.0", port=port, debug=False)
