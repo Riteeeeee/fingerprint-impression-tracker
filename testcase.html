@@ -1,0 +1,21 @@
+<head>
+    <script type="text/javascript" src="//shop.com:8080/id-generator.js"></script>
+    <script>
+        iDx.config = {
+            serverUrl: "http://shop.com:8080"
+        }
+
+        /* onIdAquired YAHAN set karo — DOMContentLoaded ka wait mat karo */
+        iDx.onIdAquired = function (ident) {
+            var el = document.getElementById("identifier");
+            if (el) el.innerHTML = "Id from id-generator = " + ident.toString();
+        }
+
+        window.addEventListener("DOMContentLoaded", () => {
+           console.log("DOM is fully loaded! Going to acquire ID.");
+        });
+    </script>
+</head>
+<body>
+    <h1 id="identifier">Acquiring ID...</h1>
+</body>

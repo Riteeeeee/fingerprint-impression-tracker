@@ -1,0 +1,10 @@
+00:17:39 [INFO] =======================================================
+00:17:39 [INFO]   NitroCommerce Identity Registry  v1.0.0
+00:17:39 [INFO]   http://0.0.0.0:8080/
+00:17:39 [INFO]   POST /api/get-id   — resolve / mint ID
+00:17:39 [INFO]   GET  /api/registry — dev dump
+00:17:39 [INFO] =======================================================
+ * Serving Flask app 'app'
+ * Debug mode: on
+Address already in use
+Port 8080 is in use by another program. Either identify and stop that program, or start the server with a different port.
