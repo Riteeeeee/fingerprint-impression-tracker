@@ -1,8 +1,7 @@
 /**
  * ================================================================
  *  id-generator.js  —  NitroCommerce Cross-Site Identity SDK
- *  Version : 1.0.0
- *  Author  : Hackathon Team
+ *  Version : 2.0.0
  * ================================================================
  *
  *  USAGE (one line per partner site):
@@ -12,26 +11,37 @@
  *    window.iDx.config       — set config keys before DOMContentLoaded
  *    window.iDx.onIdAquired  — callback(ident: string) fired with the ID
  *
- *  HOW IT WORKS:
- *    1. Collects hardware-bound browser signals (canvas GPU hash,
- *       AudioContext DAC hash, screen geometry, platform, UA).
- *    2. Derives a deterministic 12-char hardware key from those signals.
- *    3. Checks local cache (localStorage → IndexedDB) for a stored ID.
- *    4. If cached → returns immediately without a network call.
- *    5. If not cached → POSTs fingerprint to /api/get-id on the
- *       configured server, caches the returned ntrx_ ID, fires callback.
- *    6. Logs "ID: <id>" to console as required.
+ *  NEW IN v2.0.0:
+ *  ─────────────────────────────────────────────────────────────
+ *  gpu_renderer  — WebGL UNMASKED_RENDERER_WEBGL string extracted
+ *                  via WEBGL_debug_renderer_info extension.
+ *                  Encodes GPU micro-architecture (e.g. "Apple M4 GPU").
+ *                  Safari does NOT noise-protect this. Completely
+ *                  invariant across network switches, OS updates,
+ *                  and cache clears. Falls back to "webgl_na" if
+ *                  the extension is unavailable (e.g. blocked WebGL).
  *
- *  SAFARI / ITP NOTES:
- *    - IndexedDB is used as primary persistent store (outlasts LS under ITP).
- *    - localStorage is used as fast secondary store.
- *    - No cookies are read or written anywhere.
- *    - IP address is never included in fingerprint payload.
+ *  screen_detail — Combined string of screen.width × screen.height
+ *                  × screen.colorDepth × window.devicePixelRatio.
+ *                  Reflects OS-level display scaling, custom resolution
+ *                  settings, and Dock/Menubar arrangement — all of which
+ *                  differ between users on the same hardware model.
+ *                  100% network-stable (never affected by ISP or WiFi).
  *
- *  INSTAGRAM IN-APP BROWSER NOTES:
- *    - SubtleCrypto may be unavailable; djb2 fallback hash is used.
+ *  Both new signals are included in the POST payload alongside all
+ *  existing fields. The app.py v4.0.0 backend folds them into the
+ *  stable_key hash, making each device's anchor uniquely tied to its
+ *  physical GPU and display configuration.
+ *
+ *  SAFARI / ITP NOTES (unchanged from v1):
+ *    - IndexedDB primary persistent store, localStorage backup.
+ *    - No cookies read or written.
+ *    - IP address never included in payload.
+ *
+ *  INSTAGRAM IN-APP BROWSER NOTES (unchanged):
+ *    - SubtleCrypto may be unavailable; djb2 fallback used.
  *    - OfflineAudioContext may be blocked; graceful fallback included.
- *    - fetch() is available on all modern in-app browsers.
+ *    - WebGL extension probe wrapped in try/catch; degrades cleanly.
  * ================================================================
  */
 
@@ -39,18 +49,14 @@
   "use strict";
 
   /* ─────────────────────────────────────────────────────────
-   *  GLOBAL iDx OBJECT  (exposed before any async work)
-   *  The host page may set iDx.config and iDx.onIdAquired
-   *  at any point before DOMContentLoaded fires.
+   *  GLOBAL iDx OBJECT
    * ───────────────────────────────────────────────────────── */
   win.iDx = win.iDx || {};
   win.iDx.config      = win.iDx.config      || {};
   win.iDx.onIdAquired = win.iDx.onIdAquired || null;
 
   /* ─────────────────────────────────────────────────────────
-   *  CONFIGURATION  (overridable via iDx.config)
-   *  SERVER_URL   : where your Flask app.py is hosted
-   *  FPJS_CDN_URL : optional — set to "" to skip FingerprintJS
+   *  CONFIGURATION
    * ───────────────────────────────────────────────────────── */
   function cfg(key, fallback) {
     return (win.iDx.config && win.iDx.config[key] != null)
@@ -58,23 +64,17 @@
       : fallback;
   }
 
-  var DEFAULT_SERVER = "";   // "" = same origin (works on any deployed domain)
+  var DEFAULT_SERVER = "http://localhost:8080";
   var LS_KEY         = "ntrx_id";
   var IDB_NAME       = "NtrxStore";
   var IDB_STORE      = "ids";
   var IDB_KEY        = "ntrx_id";
-  // UMD build — works in Safari, Instagram browser, no ES module issues
   var FPJS_URL       = "https://openfpcdn.io/fingerprintjs/v4/umd.min.js";
 
   /* ================================================================
    *  SECTION 1 — HASHING UTILITIES
    * ================================================================ */
 
-  /**
-   * SHA-256 via SubtleCrypto. Falls back to djb2 if unavailable
-   * (Instagram in-app browser on some Android versions).
-   * Always returns a Promise<string>.
-   */
   function hash(msg) {
     try {
       if (win.crypto && win.crypto.subtle && win.crypto.subtle.digest) {
@@ -86,13 +86,14 @@
         });
       }
     } catch (e) { /* fall through */ }
-    // djb2 fallback
+    // djb2 fallback (Instagram in-app browser on some Android versions)
     var h = 5381;
     for (var i = 0; i < msg.length; i++) {
       h = ((h << 5) + h) ^ msg.charCodeAt(i);
     }
     return Promise.resolve(
-      (Math.abs(h) >>> 0).toString(16).padStart(8, "0") + "0000000000000000000000000000000000000000000000000000000000"
+      (Math.abs(h) >>> 0).toString(16).padStart(8, "0") +
+      "0000000000000000000000000000000000000000000000000000000000"
     );
   }
 
@@ -101,9 +102,10 @@
    * ================================================================ */
 
   /**
-   * Canvas fingerprint: render layered text + shapes to expose
-   * GPU sub-pixel antialiasing differences across hardware.
-   * Returns Promise<string> (hex digest).
+   * Canvas fingerprint: layered text + shapes expose GPU sub-pixel
+   * antialiasing differences. Returns Promise<string> (hex digest).
+   * NOTE: Safari introduces jitter on cache clear. This signal is
+   * included for coverage but carries low weight on the backend.
    */
   function canvasSignal() {
     try {
@@ -115,8 +117,8 @@
       ctx.fillStyle = "rgba(80, 180, 60, 0.65)";
       ctx.fillRect(0, 0, 320, 80);
 
-      ctx.font      = "bold 16px Arial, Helvetica, sans-serif";
-      ctx.fillStyle = "#1a6bcc";
+      ctx.font         = "bold 16px Arial, Helvetica, sans-serif";
+      ctx.fillStyle    = "#1a6bcc";
       ctx.textBaseline = "top";
       ctx.fillText("NtrxFP \u{1F680} \u03A3 \u{1F441}", 6, 10);
 
@@ -139,9 +141,8 @@
   }
 
   /**
-   * AudioContext fingerprint: routes an oscillator through a
-   * dynamics compressor; the PCM floating-point sum differs
-   * per hardware DAC / DSP implementation.
+   * AudioContext fingerprint: PCM sum from oscillator + compressor.
+   * NOTE: Safari introduces jitter on cache clear (low backend weight).
    * Returns Promise<string>.
    */
   function audioSignal() {
@@ -180,28 +181,101 @@
   }
 
   /**
-   * Collect static, network-independent metadata.
+   * NEW (v2.0.0) — WebGL unmasked renderer string.
+   *
+   * WEBGL_debug_renderer_info exposes the true GPU renderer string
+   * before any Safari privacy masking. On M4 MacBook Air this returns
+   * something like "Apple M4 GPU", which uniquely identifies the GPU
+   * micro-architecture. Safari does NOT apply noise or rotation to
+   * this extension output. It is completely invariant across:
+   *   - network switches (WiFi ↔ hotspot)
+   *   - OS updates
+   *   - Safari cache clears
+   *   - private browsing windows
+   *
+   * Falls back to "webgl_na" if WebGL is unavailable or if the
+   * extension is blocked (rare; only seen in very locked-down
+   * enterprise profiles).
+   *
+   * Returns a plain string (synchronous — no hashing needed since
+   * the raw string is already highly unique and readable in logs).
+   */
+  function gpuRendererSignal() {
+    try {
+      var canvas = doc.createElement("canvas");
+      var gl = canvas.getContext("webgl") || canvas.getContext("experimental-webgl");
+      if (!gl) return "webgl_na";
+
+      var ext = gl.getExtension("WEBGL_debug_renderer_info");
+      if (!ext) return "webgl_ext_na";
+
+      var renderer = gl.getParameter(ext.UNMASKED_RENDERER_WEBGL) || "unknown_renderer";
+      var vendor   = gl.getParameter(ext.UNMASKED_VENDOR_WEBGL)   || "unknown_vendor";
+
+      // Combine vendor + renderer for maximum entropy.
+      // e.g. "Apple|Apple M4 GPU" on M4 MacBook Air.
+      return (vendor + "|" + renderer).substring(0, 128);
+    } catch (e) {
+      return "webgl_blocked";
+    }
+  }
+
+  /**
+   * NEW (v2.0.0) — Exact screen metrics + device pixel ratio.
+   *
+   * window.devicePixelRatio reflects the user's OS-level display
+   * scaling setting (e.g. "More Space" vs "Default" in macOS Display
+   * Preferences). Two M4 MacBook Airs with different scaling settings
+   * will produce DIFFERENT screen_detail strings even if their raw
+   * screen.width and screen.height are identical.
+   *
+   * colorDepth adds further separation. Together, the four values
+   * form a composite that is:
+   *   - Completely unaffected by network changes
+   *   - Not noise-injected by Safari
+   *   - Different for users who customise their display scaling
+   *
+   * Format: "WxHxCDxDPR"  e.g. "2560x1664x30x2"
+   * Returns a plain string (synchronous).
+   */
+  function screenDetailSignal() {
+    try {
+      var s   = win.screen || {};
+      var dpr = win.devicePixelRatio || 1;
+      return [
+        s.width      || "?",
+        s.height     || "?",
+        s.colorDepth || "?",
+        dpr
+      ].join("x");
+    } catch (e) {
+      return "screen_detail_blocked";
+    }
+  }
+
+  /**
+   * Static, network-independent metadata (unchanged from v1).
+   * tz and lang are now used only as soft gatekeeper fields on the
+   * backend, not as primary key material.
    */
   function staticSignals() {
     var s = win.screen || {};
     return {
-      screen  : (s.width||"?") + "x" + (s.height||"?") + "x" + (s.colorDepth||"?"),
-      platform: (navigator.platform || "unknown").substring(0, 32),
-      ua      : (navigator.userAgent || "unknown").substring(0, 200),
+      screen  : (s.width  || "?") + "x" + (s.height || "?") + "x" + (s.colorDepth || "?"),
+      platform: (navigator.platform   || "unknown").substring(0, 32),
+      ua      : (navigator.userAgent  || "unknown").substring(0, 200),
       tz      : (function () {
         try { return Intl.DateTimeFormat().resolvedOptions().timeZone; }
-        catch(e) { return "unknown"; }
+        catch (e) { return "unknown"; }
       })(),
       cores   : navigator.hardwareConcurrency || "?",
-      ram     : navigator.deviceMemory || "?",
-      lang    : navigator.language || "unknown"
+      ram     : navigator.deviceMemory        || "?",
+      lang    : navigator.language            || "unknown"
     };
   }
 
   /* ================================================================
    *  SECTION 3 — LOCAL CACHE  (IndexedDB primary, localStorage backup)
-   *  Safari ITP deletes localStorage for cross-site scripts after
-   *  7 days of no interaction; IDB lasts longer in first-party context.
    * ================================================================ */
 
   function openIDB() {
@@ -262,13 +336,10 @@
 
   /* ================================================================
    *  SECTION 4 — OPTIONAL: FingerprintJS v4 LOADER
-   *  Adds high-entropy visitorId (GPU/font/audio mix) as extra signal.
-   *  Gracefully skipped if CDN fails or is blocked.
    * ================================================================ */
 
   function loadFPJS() {
     return new Promise(function (resolve) {
-      // Already loaded and valid
       if (win.FingerprintJS && typeof win.FingerprintJS.load === "function") {
         win.FingerprintJS.load().then(resolve).catch(function () { resolve(null); });
         return;
@@ -276,35 +347,33 @@
       var s   = doc.createElement("script");
       s.src   = FPJS_URL;
       s.async = true;
-      s.onload  = function () {
-        // Small delay to let UMD bundle register itself on window
+      s.onload = function () {
         setTimeout(function () {
           if (win.FingerprintJS && typeof win.FingerprintJS.load === "function") {
             win.FingerprintJS.load().then(resolve).catch(function () { resolve(null); });
           } else {
-            resolve(null); // FPJS loaded but unexpected format — skip gracefully
+            resolve(null);
           }
         }, 50);
       };
-      s.onerror = function () { resolve(null); }; // CDN blocked — skip gracefully
+      s.onerror = function () { resolve(null); };
       (doc.head || doc.documentElement).appendChild(s);
     });
   }
 
   /* ================================================================
-   *  SECTION 5 — HARDWARE KEY  (server-side mirror of build_hardware_hash)
-   *  Combines the five most stable signals into a deterministic 12-char
-   *  hex key.  Used here just to build the local-only ID suffix so
-   *  IDs are human-readable and collision-resistant enough for a demo.
+   *  SECTION 5 — HARDWARE KEY  (local offline fallback)
    * ================================================================ */
 
   function buildHardwareKey(fp) {
     var raw = [
-      fp.visitorId || "",
-      fp.canvas    || "",
-      fp.audio     || "",
-      fp.screen    || "",
-      fp.platform  || ""
+      fp.visitorId    || "",
+      fp.canvas       || "",
+      fp.audio        || "",
+      fp.screen       || "",
+      fp.platform     || "",
+      fp.gpu_renderer || "",    // NEW — included for offline ID entropy
+      fp.screen_detail|| ""     // NEW — included for offline ID entropy
     ].join("|");
     return hash(raw).then(function (h) { return h.substring(0, 12); });
   }
@@ -314,9 +383,7 @@
    * ================================================================ */
 
   function deliver(id) {
-    /* Required console format */
     console.log("ID: " + id);
-    /* Fire host-page callback if registered */
     if (typeof win.iDx.onIdAquired === "function") {
       try { win.iDx.onIdAquired(id); } catch (e) {}
     }
@@ -330,18 +397,24 @@
         return;
       }
 
-      /* ── 2. Collect hardware signals in parallel ── */
       var serverBase = cfg("serverUrl", DEFAULT_SERVER).replace(/\/$/, "");
       var endpoint   = serverBase + "/api/get-id";
 
+      /* ── 2. Collect all signals in parallel ── */
       Promise.all([
-        canvasSignal(),
-        audioSignal(),
-        loadFPJS()
+        canvasSignal(),   // async (SubtleCrypto)
+        audioSignal(),    // async (OfflineAudioContext)
+        loadFPJS()        // async (CDN script load)
       ]).then(function (results) {
         var canvasHash = results[0];
         var audioHash  = results[1];
-        var fpAgent    = results[2];   // may be null if CDN blocked
+        var fpAgent    = results[2];
+
+        // gpuRendererSignal and screenDetailSignal are synchronous —
+        // collect them here, outside the inner Promise chain, so they
+        // are available regardless of FingerprintJS CDN availability.
+        var gpuRenderer  = gpuRendererSignal();    // NEW
+        var screenDetail = screenDetailSignal();   // NEW
 
         var getFPVisitorId = fpAgent
           ? fpAgent.get().then(function (r) { return r.visitorId; })
@@ -353,16 +426,18 @@
 
           /* ── 3. Build payload ── */
           var payload = {
-            visitorId : visitorId,
-            canvas    : canvasHash,
-            audio     : audioHash,
-            screen    : meta.screen,
-            platform  : meta.platform,
-            ua        : meta.ua,
-            tz        : meta.tz,
-            cores     : meta.cores,
-            ram       : meta.ram,
-            lang      : meta.lang
+            visitorId    : visitorId,
+            canvas       : canvasHash,
+            audio        : audioHash,
+            screen       : meta.screen,
+            platform     : meta.platform,
+            ua           : meta.ua,
+            tz           : meta.tz,
+            cores        : meta.cores,
+            ram          : meta.ram,
+            lang         : meta.lang,
+            gpu_renderer : gpuRenderer,    // NEW — WebGL unmasked renderer
+            screen_detail: screenDetail    // NEW — w×h×colorDepth×DPR
             /* NOTE: IP address intentionally omitted */
           };
 
@@ -377,28 +452,27 @@
             return res.json();
           }).then(function (data) {
             var id = data.id;
-            /* ── 5. Cache locally ── */
             return persist(id).then(function () { return id; });
           });
         });
       }).then(function (id) {
-        /* ── 6. Deliver ── */
+        /* ── 5. Deliver ── */
         deliver(id);
       }).catch(function (err) {
-        /* Server unreachable — derive a local ID from hardware signals
-           so the callback still fires and the page isn't broken.       */
+        /* Server unreachable — derive a local ID from hardware signals */
         console.warn("[NitroTracker] Server unavailable, using local ID:", err.message);
         Promise.all([canvasSignal(), audioSignal()]).then(function (sigs) {
           var meta = staticSignals();
           return buildHardwareKey({
-            visitorId: "offline",
-            canvas   : sigs[0],
-            audio    : sigs[1],
-            screen   : meta.screen,
-            platform : meta.platform
+            visitorId    : "offline",
+            canvas       : sigs[0],
+            audio        : sigs[1],
+            screen       : meta.screen,
+            platform     : meta.platform,
+            gpu_renderer : gpuRendererSignal(),   // NEW
+            screen_detail: screenDetailSignal()   // NEW
           });
         }).then(function (hwKey) {
-          /* Local IDs use "ntrx_local_" prefix to distinguish from server IDs */
           var localId = "ntrx_local_" + hwKey + "_" + Date.now().toString(36);
           return persist(localId).then(function () { return localId; });
         }).then(function (localId) {
@@ -409,13 +483,11 @@
   }
 
   /* ─────────────────────────────────────────────────────────
-   *  ENTRY POINT — fire after DOM is interactive
+   *  ENTRY POINT
    * ───────────────────────────────────────────────────────── */
   if (doc.readyState === "loading") {
     doc.addEventListener("DOMContentLoaded", runTracker);
   } else {
-    /* Script loaded async after DOM — run on next tick so host-page
-       inline scripts (including iDx.onIdAquired assignment) execute first */
     setTimeout(runTracker, 0);
   }
 
