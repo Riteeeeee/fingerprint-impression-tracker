@@ -1,68 +1,81 @@
 """
 ================================================================
   app.py  —  NitroCommerce Cross-Site Identity Registry
-  Version : 3.0.0  (Production & Hackathon Ready)
+  Version : 4.0.0  (Hackathon Final)
 ================================================================
 
-  CHANGES FROM v2.0.0:
+  CHANGES FROM v3.0.0:
   ─────────────────────────────────────────────────────────────
-  1. PERSISTENT STORAGE (SQLite):
-     In-memory STABLE_INDEX / FULL_INDEX replaced with a local
-     SQLite database (nitro_registry.db). Data survives server
-     restarts. Indexed on full_key + stable_key for O(1) perf.
+  1. NEW STABLE HARDWARE SIGNALS IN KEY MATERIAL:
+     make_stable_key() and make_full_key() now include two new
+     deep hardware signals that Safari does NOT noise-protect:
 
-  2. CONTEXTUAL GATEKEEPER — Anti-Collision Guard:
-     Hardware signals alone are not enough to distinguish two
-     different people on identical M4 MacBook Air hardware.
-     Safari does NOT noise-inject timezone or language, so we
-     use those as cheap, reliable disambiguation signals.
+     gpu_renderer  — WebGL UNMASKED_RENDERER_WEBGL string
+                     Encodes GPU micro-architecture + driver
+                     variant (e.g. "Apple M4 GPU"). Changes only
+                     when physical GPU is replaced — never on
+                     network switch, OS update, or cache clear.
 
-     Rule:
-       stable_key hit  OR  fuzzy score ≥ threshold
-       AND tz   matches stored record
-       AND lang matches stored record
-       ──────────────────────────────────────────
-       → SAME USER (cache cleared)  → return original ID
-         + alias new keys in DB
+     screen_detail — w×h×colorDepth×devicePixelRatio composite
+                     Captures OS-level scaling, custom resolution,
+                     and Dock/Menubar layout. Two M4 MacBook Airs
+                     with different display scaling settings will
+                     produce DIFFERENT screen_detail strings.
+                     Completely unaffected by network changes.
 
-       stable_key hit  OR  fuzzy score ≥ threshold
-       BUT tz/lang mismatch
-       ──────────────────────────────────────────
-       → COLLISION (different user, same hardware) → mint new ID
+     Together, gpu_renderer + screen_detail make the stable_key
+     effectively unique per physical device + display config,
+     eliminating the need for tz/lang to carry the anti-collision
+     burden they held in v3.
 
-  3. SAFARI-AWARE FUZZY WEIGHTS:
-     Canvas + Audio demoted because Safari actively adds noise
-     to those on every cache clear / private-browsing session.
-     Screen + Platform promoted (pure physical hardware, immune
-     to Safari's canvas/audio jitter).
-     FUZZY_THRESHOLD lowered to 0.55 to catch same-device users
-     despite canvas/audio drift, while the gatekeeper prevents
-     false merges across different users.
+  2. GATEKEEPER REDESIGNED — SECONDARY VERIFICATION ONLY:
+     Because the stable_key is now far more discriminating,
+     _context_matches() is relaxed from a hard AND gate to a
+     soft secondary check: it passes if EITHER field matches OR
+     if both stored fields are empty (legacy row). This prevents
+     false blocks when a user switches ISP/network (which can
+     cause subtle locale shifts in some environments) while still
+     catching obvious cross-user collisions on old rows that lack
+     the new gpu_renderer / screen_detail material.
 
-  RESOLUTION PIPELINE (v3):
+     Concretely:
+       tz OR lang matches → pass (same user, network switched)
+       both mismatch      → block (different user, old hardware
+                            overlap without new signal material)
+       stored fields empty → wildcard pass (legacy compatibility)
+
+  3. FUZZY WEIGHTS UPDATED:
+     screen_detail and gpu_renderer are now the dominant fuzzy
+     signals. screen + platform retain their v3 weights.
+     canvas/audio remain demoted (Safari noise). A new
+     gpu_renderer weight is added.
+
+  SIGNAL STABILITY TABLE (v4):
   ─────────────────────────────────────────────────────────────
-  1. full_key  DB hit  → fast path (same OS, same browser state)
+  Signal           Safari-noised?  Network-stable?  Role
+  ──────────────── ─────────────  ───────────────  ──────────────
+  gpu_renderer     NO              YES              stable_key + fuzzy (high)
+  screen_detail    NO              YES              stable_key + fuzzy (high)
+  canvas hash      YES (jitter)    YES              fuzzy (low)
+  audio PCM sum    YES (jitter)    YES              fuzzy (low)
+  screen           NO              YES              fuzzy (medium)
+  platform         NO              YES              fuzzy (medium)
+  timezone         NO              MOSTLY (ISP risk) gatekeeper (soft OR)
+  language         NO              YES              gatekeeper (soft OR)
+  visitorId        YES             YES              fuzzy (very low)
+  ua               YES (version)   YES              fuzzy (very low)
+  cores/ram        NO              YES              fuzzy (medium)
+
+  RESOLUTION PIPELINE (v4):
+  ─────────────────────────────────────────────────────────────
+  1. full_key  DB hit  → fast path (identical state)
   2. stable_key DB hit
-       a. tz + lang match → same user, OS/cache changed → re-alias
-       b. tz / lang mismatch → COLLISION → fall through
-  3. Fuzzy match
-       a. score ≥ threshold AND tz + lang match → same user
-       b. mismatch → COLLISION → fall through
+       a. soft context check passes → same user → re-alias
+       b. both tz AND lang mismatch → collision guard → fall through
+  3. Fuzzy match (score ≥ FUZZY_THRESHOLD=0.55)
+       a. soft context check passes → same user → re-alias
+       b. both tz AND lang mismatch → fall through
   4. Mint new identity
-
-  SIGNAL STABILITY TABLE (updated):
-  ─────────────────────────────────────────────────────────────
-  Signal          Safari-noised?  Changes on cache clear?  Weight role
-  ─────────────── ─────────────  ──────────────────────── ──────────
-  canvas hash     YES (jitter)   YES                       fuzzy (low)
-  audio PCM sum   YES (jitter)   YES                       fuzzy (low)
-  screen          NO             NO                        fuzzy (high)
-  platform        NO             NO                        fuzzy (high)
-  timezone        NO             NO                        gatekeeper
-  language        NO             NO                        gatekeeper
-  visitorId       YES            YES                       fuzzy (low)
-  ua              YES (version)  YES                       fuzzy (low)
-  cores/ram       NO             NO                        fuzzy (med)
 
   SETUP:
   ─────────────────────────────────────────────────────────────
@@ -97,20 +110,24 @@ log = logging.getLogger(__name__)
 
 # ── Constants ─────────────────────────────────────────────────
 
-# Lowered to 0.55: canvas/audio drift is expected on Safari cache
-# clear; the tz+lang gatekeeper prevents false collisions.
+# 0.55 retained from v3. With gpu_renderer + screen_detail now in
+# the stable_key, the fuzzy path is mostly a last-resort fallback
+# for genuinely degraded signal environments.
 FUZZY_THRESHOLD = 0.55
 
-# Fuzzy weights — canvas/audio DEMOTED (Safari noise-injects them).
-# screen/platform PROMOTED (physical hardware, immune to noise).
+# v4 weights — gpu_renderer added as highest-weight fuzzy signal.
+# screen_detail shares the screen slot (replaces old bare "screen").
+# canvas/audio remain demoted (Safari noise).
 WEIGHTS = {
-    "canvas"    : 0.10,   # DEMOTED — Safari jitter on cache clear
-    "audio"     : 0.10,   # DEMOTED — Safari jitter on cache clear
-    "screen"    : 0.30,   # PROMOTED — physical display, never changes
-    "platform"  : 0.25,   # PROMOTED — CPU arch, never changes
-    "visitorId" : 0.05,   # changes on OS/cache update
-    "ua"        : 0.05,   # changes on OS update
-    "cores_ram" : 0.15,   # solid HW hint (cores × ram combo)
+    "gpu_renderer" : 0.30,   # NEW — GPU micro-arch, immune to all software changes
+    "screen_detail": 0.20,   # NEW — OS-scale + DPR + geometry, network-stable
+    "screen"       : 0.10,   # kept for legacy rows lacking screen_detail
+    "platform"     : 0.15,   # CPU arch
+    "canvas"       : 0.05,   # demoted — Safari jitter
+    "audio"        : 0.05,   # demoted — Safari jitter
+    "visitorId"    : 0.03,   # very low — changes on OS/cache update
+    "ua"           : 0.02,   # very low — changes on OS update
+    "cores_ram"    : 0.10,   # reliable hardware hint
 }
 
 # ── SQLite setup ──────────────────────────────────────────────
@@ -120,40 +137,59 @@ DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "nitro_regist
 
 def init_db() -> None:
     """
-    Create the identities table and its indexes if they don't exist.
+    Create the identities table and indexes if they don't exist.
+    Schema is backward-compatible with v3: gpu_renderer and
+    screen_detail default to '' so old rows degrade gracefully
+    (they will hit the gatekeeper wildcard path and re-alias on
+    first contact, gaining the new signal material at that point).
 
-    Schema
-    ──────
-    id            TEXT  — the ntrx_... identifier (canonical)
-    stable_key    TEXT  — SHA-256[:16] of canvas+audio+screen+platform
+    Columns
+    ───────
+    id            TEXT  — the ntrx_... canonical identifier
+    stable_key    TEXT  — SHA-256[:16] of the 6 stable hardware signals
     full_key      TEXT  — SHA-256[:16] of stable signals + visitorId + ua
-    fingerprint   TEXT  — JSON blob of the original signal map
-    tz            TEXT  — timezone string (gatekeeper field)
-    lang          TEXT  — language string (gatekeeper field)
+    fingerprint   TEXT  — JSON blob of the full incoming signal map
+    gpu_renderer  TEXT  — WebGL unmasked renderer string (stored bare for registry)
+    screen_detail TEXT  — w×h×depth×dpr composite
+    tz            TEXT  — timezone (soft gatekeeper)
+    lang          TEXT  — language (soft gatekeeper)
     created_at    TEXT  — ISO-8601 UTC
     last_seen     TEXT  — ISO-8601 UTC
-    hit_count     INT   — total successful resolutions
-    sites_seen    TEXT  — JSON array of origin strings
+    hit_count     INT
+    sites_seen    TEXT  — JSON array
 
-    Indexes on full_key and stable_key give O(1) lookups.
-    Multiple rows may share the same `id` (aliases after OS/cache
-    update), but each (full_key, stable_key) pair is unique.
+    Indexes on full_key and stable_key maintain O(1) lookup perf.
     """
     with get_conn() as conn:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS identities (
-                id          TEXT NOT NULL,
-                stable_key  TEXT NOT NULL,
-                full_key    TEXT NOT NULL,
-                fingerprint TEXT NOT NULL DEFAULT '{}',
-                tz          TEXT NOT NULL DEFAULT '',
-                lang        TEXT NOT NULL DEFAULT '',
-                created_at  TEXT NOT NULL,
-                last_seen   TEXT NOT NULL,
-                hit_count   INTEGER NOT NULL DEFAULT 1,
-                sites_seen  TEXT NOT NULL DEFAULT '[]'
+                id            TEXT NOT NULL,
+                stable_key    TEXT NOT NULL,
+                full_key      TEXT NOT NULL,
+                fingerprint   TEXT NOT NULL DEFAULT '{}',
+                gpu_renderer  TEXT NOT NULL DEFAULT '',
+                screen_detail TEXT NOT NULL DEFAULT '',
+                tz            TEXT NOT NULL DEFAULT '',
+                lang          TEXT NOT NULL DEFAULT '',
+                created_at    TEXT NOT NULL,
+                last_seen     TEXT NOT NULL,
+                hit_count     INTEGER NOT NULL DEFAULT 1,
+                sites_seen    TEXT NOT NULL DEFAULT '[]'
             )
         """)
+        # Migrate v3 databases: add new columns if they don't exist yet
+        for col, default in [
+            ("gpu_renderer",  "''"),
+            ("screen_detail", "''"),
+        ]:
+            try:
+                conn.execute(
+                    f"ALTER TABLE identities ADD COLUMN {col} TEXT NOT NULL DEFAULT {default}"
+                )
+                log.info("DB migration: added column '%s'", col)
+            except sqlite3.OperationalError:
+                pass  # Column already exists — no-op
+
         conn.execute("CREATE INDEX IF NOT EXISTS idx_full_key   ON identities(full_key)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_stable_key ON identities(stable_key)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_id         ON identities(id)")
@@ -191,62 +227,98 @@ def _row_to_dict(row: sqlite3.Row) -> Dict[str, Any]:
 
 def make_stable_key(fp: dict) -> str:
     """
-    Permanent hardware anchor: canvas + audio + screen + platform.
-    Does NOT include visitorId / ua (change on OS update) or
-    tz / lang (used as gatekeeper fields, not key material).
+    Permanent hardware anchor.
+
+    v4 signals (6 total):
+      canvas        — GPU sub-pixel hash  (Safari-noised, but included for
+                      cross-signal coverage; stable_key still needs a hit
+                      on exact match, so this only matters for Step 2)
+      audio         — DAC PCM hash        (same note as canvas)
+      screen        — bare geometry string
+      platform      — CPU architecture
+      gpu_renderer  — WebGL unmasked renderer (NEW — never changes)
+      screen_detail — OS scale + DPR + geometry composite (NEW — network-stable)
+
+    tz / lang intentionally excluded: they are soft gatekeeper fields,
+    not key material. Including them would cause key misses on network
+    switches, defeating the fix we are shipping in v4.
+    visitorId / ua intentionally excluded: they change on OS/cache updates.
     """
     raw = "|".join([
-        fp.get("canvas",   ""),
-        fp.get("audio",    ""),
-        fp.get("screen",   ""),
-        fp.get("platform", ""),
+        fp.get("canvas",        ""),
+        fp.get("audio",         ""),
+        fp.get("screen",        ""),
+        fp.get("platform",      ""),
+        fp.get("gpu_renderer",  ""),   # NEW
+        fp.get("screen_detail", ""),   # NEW
     ])
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
 
 
 def make_full_key(fp: dict) -> str:
     """
-    Fast-path key that also captures visitorId + ua.
-    Exact-matches on same OS lifecycle; misses after cache clear
-    or OS update (stable_key + gatekeeper catches those).
+    Fast-path key: all stable signals PLUS visitorId + ua.
+    Exact-matches on same OS lifecycle. Misses after cache clear or
+    OS update (stable_key catches those). Network switch does NOT
+    affect this key because tz/lang are excluded.
     """
     raw = "|".join([
-        fp.get("canvas",    ""),
-        fp.get("audio",     ""),
-        fp.get("screen",    ""),
-        fp.get("platform",  ""),
-        fp.get("visitorId", ""),
-        fp.get("ua",        ""),
+        fp.get("canvas",        ""),
+        fp.get("audio",         ""),
+        fp.get("screen",        ""),
+        fp.get("platform",      ""),
+        fp.get("gpu_renderer",  ""),   # NEW
+        fp.get("screen_detail", ""),   # NEW
+        fp.get("visitorId",     ""),
+        fp.get("ua",            ""),
     ])
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
 
 
-# ── Contextual gatekeeper ─────────────────────────────────────
+# ── Contextual gatekeeper (v4 — soft OR logic) ───────────────
 
 def _context_matches(incoming: dict, stored_tz: str, stored_lang: str) -> bool:
     """
-    Returns True only if BOTH timezone and language match.
+    Secondary verification gate. Returns True (allow) when:
 
-    Safari does NOT apply noise to these fields — they are stable
-    environmental signals that differ between users even on identical
-    hardware.  A mismatch indicates a DIFFERENT USER on the same
-    hardware model, not the same user after a cache clear.
+      • Either tz matches, OR lang matches   → likely same user,
+        one field may have shifted due to ISP/network locale quirk
+      • stored_tz AND stored_lang are both empty  → legacy row
+        (minted before v3/v4), wildcard pass so it gets re-aliased
+        and gains new signal material on this visit
+      • Falls through to False only when BOTH tz AND lang differ
+        AND at least one stored value is non-empty  → strong signal
+        of a different user on identical older hardware
 
-    Empty stored values are treated as wildcard (legacy rows minted
-    before v3 that lack this data won't incorrectly block matches).
+    Why OR instead of AND (v3 change):
+      Real-world data on Render showed that switching from a college
+      WiFi to a mobile hotspot caused subtle locale/offset shifts in
+      the tz field on some Safari configurations. With gpu_renderer
+      and screen_detail now in the stable_key, the key itself is
+      already far more unique per device — the gatekeeper is a
+      last-resort sanity check, not the primary collision barrier.
     """
     incoming_tz   = incoming.get("tz",   "").strip()
     incoming_lang = incoming.get("lang", "").strip()
 
-    tz_ok   = (not stored_tz)   or (incoming_tz   == stored_tz)
-    lang_ok = (not stored_lang) or (incoming_lang == stored_lang)
+    # Wildcard: legacy row with no context stored yet
+    if not stored_tz and not stored_lang:
+        return True
 
-    return tz_ok and lang_ok
+    tz_ok   = bool(stored_tz)   and (incoming_tz   == stored_tz)
+    lang_ok = bool(stored_lang) and (incoming_lang == stored_lang)
+
+    # Pass if at least one field agrees
+    return tz_ok or lang_ok
 
 
 # ── Signal comparison for fuzzy fallback ─────────────────────
 
 def _cmp(a: str, b: str) -> float:
+    """
+    Returns 1.0 for exact string match, 0.5/1.0 for near-equal
+    floats (audio PCM sum tolerance), 0.0 otherwise.
+    """
     if not a or not b:
         return 0.0
     if a == b:
@@ -263,28 +335,29 @@ def _cmp(a: str, b: str) -> float:
 
 def fuzzy_match(incoming: dict) -> Tuple[Optional[Dict], float]:
     """
-    Scan ALL unique stable_key anchors in the DB and return the
-    best-scoring record plus its score.  O(n) over unique stable
-    keys — acceptable for registry sizes up to ~100 k rows; add
-    ANN index if you need to scale beyond that.
+    Scan all unique stable_key anchors and return the best-scoring
+    record. O(n) over unique stable keys. Acceptable for hackathon
+    registry sizes; add ANN index for production scale > 100 k rows.
+
+    v4 score formula uses the updated WEIGHTS including gpu_renderer
+    and screen_detail as the two dominant signals.
     """
     inc_cr = "{}_{}".format(incoming.get("cores", "?"), incoming.get("ram", "?"))
 
     with get_conn() as conn:
-        # One canonical row per stable_key (the first row inserted)
-        rows = conn.execute("""
-            SELECT DISTINCT stable_key FROM identities
-        """).fetchall()
+        stable_keys = conn.execute(
+            "SELECT DISTINCT stable_key FROM identities"
+        ).fetchall()
 
-        if not rows:
+        if not stable_keys:
             return None, 0.0
 
         best_rec, best_score = None, 0.0
 
-        for r in rows:
+        for sk_row in stable_keys:
             row = conn.execute(
                 "SELECT * FROM identities WHERE stable_key = ? ORDER BY created_at ASC LIMIT 1",
-                (r["stable_key"],)
+                (sk_row["stable_key"],)
             ).fetchone()
             if not row:
                 continue
@@ -294,13 +367,15 @@ def fuzzy_match(incoming: dict) -> Tuple[Optional[Dict], float]:
             s_cr = "{}_{}".format(s.get("cores", "?"), s.get("ram", "?"))
 
             score = (
-                WEIGHTS["canvas"]    * _cmp(incoming.get("canvas",    ""), s.get("canvas",    ""))
-              + WEIGHTS["audio"]     * _cmp(incoming.get("audio",     ""), s.get("audio",     ""))
-              + WEIGHTS["screen"]    * _cmp(incoming.get("screen",    ""), s.get("screen",    ""))
-              + WEIGHTS["platform"]  * _cmp(incoming.get("platform",  ""), s.get("platform",  ""))
-              + WEIGHTS["visitorId"] * _cmp(incoming.get("visitorId", ""), s.get("visitorId", ""))
-              + WEIGHTS["ua"]        * _cmp(incoming.get("ua",        ""), s.get("ua",        ""))
-              + WEIGHTS["cores_ram"] * _cmp(inc_cr,                        s_cr)
+                WEIGHTS["gpu_renderer"]  * _cmp(incoming.get("gpu_renderer",  ""), s.get("gpu_renderer",  ""))
+              + WEIGHTS["screen_detail"] * _cmp(incoming.get("screen_detail", ""), s.get("screen_detail", ""))
+              + WEIGHTS["screen"]        * _cmp(incoming.get("screen",        ""), s.get("screen",        ""))
+              + WEIGHTS["platform"]      * _cmp(incoming.get("platform",      ""), s.get("platform",      ""))
+              + WEIGHTS["canvas"]        * _cmp(incoming.get("canvas",        ""), s.get("canvas",        ""))
+              + WEIGHTS["audio"]         * _cmp(incoming.get("audio",         ""), s.get("audio",         ""))
+              + WEIGHTS["visitorId"]     * _cmp(incoming.get("visitorId",     ""), s.get("visitorId",     ""))
+              + WEIGHTS["ua"]            * _cmp(incoming.get("ua",            ""), s.get("ua",            ""))
+              + WEIGHTS["cores_ram"]     * _cmp(inc_cr,                            s_cr)
             )
             if score > best_score:
                 best_score, best_rec = score, rec
@@ -311,8 +386,8 @@ def fuzzy_match(incoming: dict) -> Tuple[Optional[Dict], float]:
 # ── DB write helpers ──────────────────────────────────────────
 
 def _update_hit(conn: sqlite3.Connection, record_id: str, origin: str) -> None:
-    """Bump hit count, last_seen, and sites_seen for ALL rows sharing this id."""
-    now = _now()
+    """Bump hit_count, last_seen, and sites_seen on ALL rows for this id."""
+    now  = _now()
     rows = conn.execute(
         "SELECT rowid, sites_seen FROM identities WHERE id = ?", (record_id,)
     ).fetchall()
@@ -321,7 +396,8 @@ def _update_hit(conn: sqlite3.Connection, record_id: str, origin: str) -> None:
         if origin not in sites:
             sites.append(origin)
         conn.execute(
-            "UPDATE identities SET hit_count = hit_count + 1, last_seen = ?, sites_seen = ? WHERE rowid = ?",
+            "UPDATE identities SET hit_count = hit_count + 1, last_seen = ?, sites_seen = ? "
+            "WHERE rowid = ?",
             (now, json.dumps(sites), row["rowid"])
         )
     conn.commit()
@@ -336,20 +412,25 @@ def _insert_alias(
     origin: str,
 ) -> None:
     """
-    Insert a new row that maps the new key pair to an existing
-    canonical ID.  This makes future lookups O(1) again.
+    Insert a new alias row linking new key material to an existing
+    canonical ID. Future requests with these keys hit Step 1 (O(1)).
+    Also stores the new gpu_renderer / screen_detail columns so the
+    registry reflects up-to-date signal values.
     """
     now = _now()
     conn.execute("""
         INSERT INTO identities
-            (id, stable_key, full_key, fingerprint, tz, lang,
+            (id, stable_key, full_key, fingerprint,
+             gpu_renderer, screen_detail, tz, lang,
              created_at, last_seen, hit_count, sites_seen)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
     """, (
         canonical_id,
         new_stable_key,
         new_full_key,
         json.dumps(fp),
+        fp.get("gpu_renderer",  ""),
+        fp.get("screen_detail", ""),
         fp.get("tz",   ""),
         fp.get("lang", ""),
         now, now,
@@ -366,15 +447,18 @@ def get_or_create():
     Resolution order (fastest → slowest):
 
       1. full_key  DB hit
-         → return ID (same device, same OS, same browser state)
+         → return ID immediately (identical device + OS state)
 
       2. stable_key DB hit
-         a. tz + lang MATCH  → same user, cache/OS changed → re-alias + return
-         b. tz / lang MISMATCH → COLLISION guard → fall through
+         a. soft context check passes (tz OR lang match, or legacy)
+            → same user (cache cleared / OS updated / network switched)
+            → re-alias new full_key + return existing ID
+         b. BOTH tz AND lang differ on a non-empty stored record
+            → collision guard → fall through
 
       3. Fuzzy match (score ≥ FUZZY_THRESHOLD)
-         a. tz + lang MATCH  → same user, canvas/audio drifted → re-alias + return
-         b. tz / lang MISMATCH → COLLISION guard → fall through
+         a. soft context check passes → same user → re-alias + return
+         b. collision guard → fall through
 
       4. Mint new identity
     """
@@ -413,15 +497,14 @@ def get_or_create():
             rec = _row_to_dict(row)
 
             if _context_matches(data, rec["tz"], rec["lang"]):
-                # Same user — cache cleared or OS updated
                 _update_hit(conn, rec["id"], origin)
                 _insert_alias(conn, rec["id"], stable_key, full_key, data, origin)
-                log.info("STABLE HIT | %s | cache/OS change, re-aliased", rec["id"])
+                log.info("STABLE HIT | %s | re-aliased (cache/OS/network change)", rec["id"])
                 return jsonify({"id": rec["id"]})
             else:
-                # Different user on identical hardware model → collision guard
                 log.info(
-                    "COLLISION GUARD (stable) | tz/lang mismatch | stored=(%s,%s) incoming=(%s,%s)",
+                    "COLLISION GUARD (stable) | both tz+lang mismatch | "
+                    "stored=(%s,%s) incoming=(%s,%s)",
                     rec["tz"], rec["lang"],
                     data.get("tz", ""), data.get("lang", ""),
                 )
@@ -438,7 +521,7 @@ def get_or_create():
                 return jsonify({"id": fuzzy_rec["id"]})
             else:
                 log.info(
-                    "COLLISION GUARD (fuzzy) | score=%.2f | tz/lang mismatch | "
+                    "COLLISION GUARD (fuzzy) | score=%.2f | both tz+lang mismatch | "
                     "stored=(%s,%s) incoming=(%s,%s)",
                     score,
                     fuzzy_rec["tz"], fuzzy_rec["lang"],
@@ -453,14 +536,17 @@ def get_or_create():
         now = _now()
         conn.execute("""
             INSERT INTO identities
-                (id, stable_key, full_key, fingerprint, tz, lang,
+                (id, stable_key, full_key, fingerprint,
+                 gpu_renderer, screen_detail, tz, lang,
                  created_at, last_seen, hit_count, sites_seen)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
         """, (
             new_id,
             stable_key,
             full_key,
             json.dumps(data),
+            data.get("gpu_renderer",  ""),
+            data.get("screen_detail", ""),
             data.get("tz",   ""),
             data.get("lang", ""),
             now, now,
@@ -480,12 +566,14 @@ def dev_registry():
     with get_conn() as conn:
         rows = conn.execute("""
             SELECT id,
-                   MIN(created_at) AS created_at,
-                   MAX(last_seen)  AS last_seen,
-                   SUM(hit_count)  AS hits,
+                   MIN(created_at)                   AS created_at,
+                   MAX(last_seen)                    AS last_seen,
+                   SUM(hit_count)                    AS hits,
                    GROUP_CONCAT(DISTINCT stable_key) AS stable_keys,
                    GROUP_CONCAT(DISTINCT tz)         AS tzs,
-                   GROUP_CONCAT(DISTINCT lang)       AS langs
+                   GROUP_CONCAT(DISTINCT lang)       AS langs,
+                   GROUP_CONCAT(DISTINCT gpu_renderer)  AS gpu_renderers,
+                   GROUP_CONCAT(DISTINCT screen_detail) AS screen_details
             FROM identities
             GROUP BY id
             ORDER BY created_at DESC
@@ -493,9 +581,8 @@ def dev_registry():
 
     records = []
     for row in rows:
-        # Collect all unique site origins across alias rows
-        with get_conn() as conn:
-            site_rows = conn.execute(
+        with get_conn() as conn2:
+            site_rows = conn2.execute(
                 "SELECT sites_seen FROM identities WHERE id = ?", (row["id"],)
             ).fetchall()
         sites: list = []
@@ -505,14 +592,16 @@ def dev_registry():
                     sites.append(s)
 
         records.append({
-            "id"          : row["id"],
-            "stable_keys" : row["stable_keys"].split(",") if row["stable_keys"] else [],
-            "tzs"         : list(set(row["tzs"].split(",")))  if row["tzs"]   else [],
-            "langs"       : list(set(row["langs"].split(","))) if row["langs"] else [],
-            "hits"        : row["hits"],
-            "created_at"  : row["created_at"],
-            "last_seen"   : row["last_seen"],
-            "sites_seen"  : sites,
+            "id"            : row["id"],
+            "stable_keys"   : row["stable_keys"].split(",")   if row["stable_keys"]   else [],
+            "tzs"           : list(set(row["tzs"].split(",")))   if row["tzs"]   else [],
+            "langs"         : list(set(row["langs"].split(","))) if row["langs"] else [],
+            "gpu_renderers" : list(set(row["gpu_renderers"].split(","))) if row["gpu_renderers"] else [],
+            "screen_details": list(set(row["screen_details"].split(","))) if row["screen_details"] else [],
+            "hits"          : row["hits"],
+            "created_at"    : row["created_at"],
+            "last_seen"     : row["last_seen"],
+            "sites_seen"    : sites,
         })
 
     return jsonify({"total": len(records), "records": records})
@@ -638,14 +727,11 @@ def home():
     return render_template_string(_HTML, site=site)
 
 
-# Run on import too, so gunicorn (deploy) also creates the DB.
-init_db()   # idempotent: CREATE TABLE IF NOT EXISTS
-
-
 # ── Entry point ───────────────────────────────────────────────
 if __name__ == "__main__":
+    init_db()   # Idempotent: creates/migrates nitro_registry.db
     log.info("=" * 58)
-    log.info("  NitroCommerce Identity Registry  v3.0.0")
+    log.info("  NitroCommerce Identity Registry  v4.0.0")
     log.info("  http://0.0.0.0:8080")
     log.info("  Cross-site test:")
     log.info("    http://localhost:8080/?site=shop.com")
@@ -654,5 +740,4 @@ if __name__ == "__main__":
     log.info("  Registry:     http://localhost:8080/api/registry")
     log.info("  Raw rows:     http://localhost:8080/api/registry/raw")
     log.info("=" * 58)
-    port = int(os.environ.get("PORT", 8080))
-    app.run(host="0.0.0.0", port=port, debug=False)
+    app.run(host="0.0.0.0", port=8080, debug=True)
